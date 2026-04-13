@@ -29,7 +29,7 @@ First build takes ~3-5 minutes — Polyscope is fetched and compiled from source
 
 | Phase | What you implement | Key concepts |
 |-------|--------------------|--------------|
-| **1 (now)** | Boilerplate + colored particle layers | Polyscope setup, particle struct |
+| **1** | Boilerplate + colored particle layers | Polyscope setup, particle struct |
 | **2** | Particle & grid data structures | B-spline weight functions, P-G indexing |
 | **3** | P2G + G2P transfer loop | APIC, mass/momentum rasterization |
 | **4** | Constitutive model | Deformation gradient F, stress tensor, equation of state |
@@ -63,7 +63,7 @@ mpm_fluid/
 
 ---
 
-## Phase 2 hints (when you're ready)
+## Phase 2 
 
 The MPM timestep loop looks like this:
 
@@ -77,9 +77,6 @@ for each timestep:
   5. G2P         (each particle reads velocity from nearby grid nodes;
                   update particle velocity, APIC affine matrix C, then position)
 ```
-
-In `simulation.h`, uncomment the `vel`, `C`, `mass`, `vol0`, `F` fields in `Particle`.
-Then implement `Simulation::step()` following the loop above.
 
 The B-spline weight for a particle at `xp` affecting grid node `i` is:
 ```
