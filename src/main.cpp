@@ -1,160 +1,344 @@
-#include "simulation.h"
-#include "polyscope/polyscope.h"
 #include "imgui.h"
+#include "polyscope/polyscope.h"
+#include "simulation.h"
 #include <iostream>
 #include <string>
 
-// ─────────────────────────────────────────────────────────────────────────────
-static Simulation* g_sim     = nullptr;
-static bool        g_running = false;
-
-// Debug mode: step through each substep manually to inspect intermediate state
-static bool        g_debug_mode = false;
+static Simulation *g_sim = nullptr;
+static bool g_running = false;
+static int g_spf = 5;
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Helpers to display a compact vector/matrix in ImGui
+//  Preset helper: applies a named configuration to the toggles so the user
+//  can jump directly to a phase-equivalent state with one click.
 // ─────────────────────────────────────────────────────────────────────────────
-static void showParticleInfo(int idx) {
-    if (idx < 0 || idx >= (int)g_sim->particles().size()) return;
-    const auto& p = g_sim->particles()[idx];
+static void applyPreset(SimToggles &t, const char *name) {
+  // Start from everything-off and enable what the named phase needs
+  t = SimToggles{}; // reset all to defaults first
 
-    ImGui::Text("pos:  (%.3f, %.3f)",  p.pos.x(), p.pos.y());
-    ImGui::Text("vel:  (%.3f, %.3f)",  p.vel.x(), p.vel.y());
-    ImGui::Text("mass: %.4f",          p.mass);
-    ImGui::Text("C:  [[%.2f, %.2f]",   p.C(0,0), p.C(0,1));
-    ImGui::Text("     [%.2f, %.2f]]",  p.C(1,0), p.C(1,1));
-    ImGui::Text("F det: %.4f",         p.F.determinant());
+  if (std::string(name) == "Phase 1") {
+    // Phase 1: particles visible, no physics at all.
+    // P2G/G2P/advect still run so the sim doesn't freeze, but all forces
+    // and constitutive models are off → particles fall as a pressureless gas
+    // (actually they just sit still because gravity is also off).
+    t.enable_gravity = false;
+    t.enable_stress = false;
+    t.enable_viscosity = false;
+    t.model_water_tait = false;
+    t.model_water_freset = false;
+    t.model_soil_elastic = false;
+    t.model_sand_plastic = false;
+    t.model_rock_elastic = false;
+
+  } else if (std::string(name) == "Phase 2") {
+    // Phase 2: gravity on, no stress forces.
+    // Particles fall under gravity via the grid, but there's no pressure
+    // or elastic resistance → layers compress through each other.
+    t.enable_gravity = true;
+    t.enable_stress = false;
+    t.enable_viscosity = false;
+    t.model_water_tait = false;
+    t.model_water_freset = true; // keep F-reset to prevent NaN
+    t.model_soil_elastic = false;
+    t.model_sand_plastic = false;
+    t.model_rock_elastic = false;
+
+  } else if (std::string(name) == "Phase 3") {
+    // Phase 3: gravity + Tait EOS pressure for all materials.
+    // All materials act as weakly compressible fluids: no shear resistance.
+    t.enable_gravity = true;
+    t.enable_stress = true;
+    t.enable_viscosity = true;
+    t.model_water_tait = true;
+    t.model_water_freset = true;
+    t.model_soil_elastic = false; // soil acts as fluid
+    t.model_sand_plastic = false; // sand acts as fluid, no yield surface
+    t.model_rock_elastic = false; // rock acts as fluid
+    // Note: soil/rock without elastic toggle still uses stressFluid-like
+    // behaviour via the Tait fallback in kirchhoffStress
+
+  } else if (std::string(name) == "Phase 4") {
+    // Phase 4: full simulation: all models active.
+    t = SimToggles{}; // all defaults = all on
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  UI callback
+//  Particle inspector helper
+// ─────────────────────────────────────────────────────────────────────────────
+static void showParticleInfo(int idx) {
+  if (idx < 0 || idx >= (int)g_sim->particles().size())
+    return;
+  const auto &p = g_sim->particles()[idx];
+  float J = p.F.determinant();
+  const char *names[] = {"Water", "Soil", "Sand", "Rock"};
+  const char *models[] = {"Fluid(Tait)", "FixedCorotated", "DruckerPrager",
+                          "?"};
+  MaterialParams mp = defaultMaterialParams(p.material);
+  int midx = (int)mp.model < 3 ? (int)mp.model : 3;
+  ImGui::Text("material : %s  (%s)", names[(int)p.material], models[midx]);
+  ImGui::Text("pos      : (%.3f, %.3f)", p.pos.x(), p.pos.y());
+  ImGui::Text("vel      : (%.3f, %.3f)", p.vel.x(), p.vel.y());
+  ImGui::Text("J=det(F) : %.4f", J);
+  ImGui::Text("F        : [[%.2f %.2f][%.2f %.2f]]", p.F(0, 0), p.F(0, 1),
+              p.F(1, 0), p.F(1, 1));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  UI callback: runs every frame
 // ─────────────────────────────────────────────────────────────────────────────
 void uiCallback() {
-    ImGui::SetNextWindowPos( ImVec2(10, 10), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(300, 460), ImGuiCond_FirstUseEver);
-    ImGui::Begin("MPM Fluid — Phase 2");
+  SimToggles &t = g_sim->toggles;
 
-    // ── Stats ──────────────────────────────────────────────────────────────
-    ImGui::Text("Particles : %zu",  g_sim->particles().size());
-    ImGui::Text("Grid      : %d x %d", g_sim->params().grid_nx,
-                                        g_sim->params().grid_ny);
-    ImGui::Text("dx        : %.4f", g_sim->params().dx);
-    ImGui::Text("dt        : %.5f", g_sim->params().dt);
-    ImGui::Text("Frame     : %d",   g_sim->frameCount());
+  // ── Main control window ──────────────────────────────────────────────────
+  ImGui::SetNextWindowPos(ImVec2(320, 10), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize(ImVec2(310, 720), ImGuiCond_FirstUseEver);
+  ImGui::Begin("MPM Debug: Phase 4");
+
+  // ── Stats ─────────────────────────────────────────────────────────────────
+  ImGui::Text("Particles : %zu", g_sim->particles().size());
+  ImGui::Text("Frame     : %d", g_sim->frameCount());
+  ImGui::Text("dt        : %.2e", g_sim->params().dt);
+  ImGui::Separator();
+
+  // ── Playback ─────────────────────────────────────────────────────────────
+  if (ImGui::Button(g_running ? " Pause " : " Play  "))
+    g_running = !g_running;
+  ImGui::SameLine();
+  if (ImGui::Button("Step x1")) {
+    g_sim->step();
+    g_sim->updatePolyscope();
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("Step x20")) {
+    for (int i = 0; i < 20; ++i)
+      g_sim->step();
+    g_sim->updatePolyscope();
+  }
+  ImGui::SliderInt("Steps/frame", &g_spf, 1, 20);
+  if (ImGui::Button("Reset")) {
+    g_running = false;
+    g_sim->initialize();
+    g_sim->updatePolyscope();
+  }
+  ImGui::Separator();
+
+  // ── Phase presets ─────────────────────────────────────────────────────────
+  // One-click shortcuts to each phase's configuration.
+  // These set the toggles below: you can then fine-tune from there.
+  ImGui::TextDisabled("— Quick presets:");
+  ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.35f, 0.55f, 1.f));
+  if (ImGui::Button("  Phase 1  ")) {
+    applyPreset(t, "Phase 1");
+    g_sim->initialize();
+    g_sim->updatePolyscope();
+    g_running = false;
+  }
+  ImGui::PopStyleColor();
+  ImGui::SameLine();
+  ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.48f, 0.35f, 1.f));
+  if (ImGui::Button("  Phase 2  ")) {
+    applyPreset(t, "Phase 2");
+    g_sim->initialize();
+    g_sim->updatePolyscope();
+    g_running = false;
+  }
+  ImGui::PopStyleColor();
+  ImGui::SameLine();
+  ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.38f, 0.10f, 1.f));
+  if (ImGui::Button("  Phase 3  ")) {
+    applyPreset(t, "Phase 3");
+    g_sim->initialize();
+    g_sim->updatePolyscope();
+    g_running = false;
+  }
+  ImGui::PopStyleColor();
+  ImGui::SameLine();
+  ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.50f, 0.15f, 0.15f, 1.f));
+  if (ImGui::Button("  Phase 4  ")) {
+    applyPreset(t, "Phase 4");
+    g_sim->initialize();
+    g_sim->updatePolyscope();
+    g_running = false;
+  }
+  ImGui::PopStyleColor();
+
+  ImGui::Separator();
+
+  // ── Phase 3 force toggles ─────────────────────────────────────────────────
+  if (ImGui::CollapsingHeader("Phase 3: Forces",
+                              ImGuiTreeNodeFlags_DefaultOpen)) {
+    ImGui::Indent(8.f);
+
+    ImGui::Checkbox("Gravity", &t.enable_gravity);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Adds m*g to each grid node's force.\n"
+                        "Off = particles float in zero-g.");
+
+    ImGui::Checkbox("Stress forces", &t.enable_stress);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Scatters -vol*tau*grad_w to grid nodes.\n"
+                        "Off = no pressure or elastic forces.\n"
+                        "Equivalent to Phase 2 behaviour.");
+
+    ImGui::Checkbox("Viscosity (water)", &t.enable_viscosity);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Adds mu*(C+C^T) to water stress.\n"
+                        "Off = inviscid fluid (more sloshing).");
+
+    ImGui::Unindent(8.f);
+  }
+
+  // ── Phase 4 constitutive model toggles ────────────────────────────────────
+  if (ImGui::CollapsingHeader("Phase 4: Constitutive models",
+                              ImGuiTreeNodeFlags_DefaultOpen)) {
+    ImGui::Indent(8.f);
+
+    ImGui::TextDisabled("Water (blue)");
+    ImGui::Checkbox("Tait EOS pressure##water", &t.model_water_tait);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("p = k*(J^{-gamma}-1)\n"
+                        "Off = water is pressureless gas.");
+    ImGui::Checkbox("F-reset##water", &t.model_water_freset);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Resets F to sqrt(J)*I each step.\n"
+                        "Off = F accumulates shear error -> blow-up\n"
+                        "at frame ~230. Turn off to see the bug.");
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("Soil (green)");
+    ImGui::Checkbox("Fixed-corotated elastic##soil", &t.model_soil_elastic);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("tau = 2*mu*(F-R)*F^T + lambda*(J-1)*J*I\n"
+                        "Off = soil acts as pressureless fluid.");
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("Sand (orange)");
+    ImGui::Checkbox("Drucker-Prager plasticity##sand", &t.model_sand_plastic);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Projects F^E onto the yield cone each step.\n"
+                        "Off = sand is elastic (no flow, no angle of repose).\n"
+                        "Compare: sand should pile at ~35 deg when ON.");
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("Rock (red)");
+    ImGui::Checkbox("Fixed-corotated elastic##rock", &t.model_rock_elastic);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Same model as soil but much stiffer E.\n"
+                        "Off = rock acts as pressureless fluid.");
+
+    ImGui::Unindent(8.f);
+  }
+
+  // ── Boundary condition toggles ────────────────────────────────────────────
+  if (ImGui::CollapsingHeader("Boundary conditions")) {
+    ImGui::Indent(8.f);
+    ImGui::Checkbox("Left wall", &t.bc_left);
+    ImGui::SameLine(120);
+    ImGui::Checkbox("Right wall", &t.bc_right);
+    ImGui::Checkbox("Bottom wall", &t.bc_bottom);
+    ImGui::SameLine(120);
+    ImGui::Checkbox("Top wall", &t.bc_top);
+    ImGui::TextWrapped("Sticky walls: zeroes the inward velocity\n"
+                       "component. Disable to see particles exit.");
+    ImGui::Unindent(8.f);
+  }
+
+  // ── Particle inspector ────────────────────────────────────────────────────
+  if (ImGui::CollapsingHeader("Particle inspector")) {
+    static int inspect_idx = 0;
+    ImGui::InputInt("Index", &inspect_idx);
+    // Quick jumps to first particle of each material type
+    if (ImGui::Button("First water")) {
+      for (int i = 0; i < (int)g_sim->particles().size(); ++i)
+        if (g_sim->particles()[i].material == MaterialType::Water) {
+          inspect_idx = i;
+          break;
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("First sand")) {
+      for (int i = 0; i < (int)g_sim->particles().size(); ++i)
+        if (g_sim->particles()[i].material == MaterialType::Sand) {
+          inspect_idx = i;
+          break;
+        }
+    }
+    if (ImGui::Button("First soil")) {
+      for (int i = 0; i < (int)g_sim->particles().size(); ++i)
+        if (g_sim->particles()[i].material == MaterialType::Soil) {
+          inspect_idx = i;
+          break;
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("First rock")) {
+      for (int i = 0; i < (int)g_sim->particles().size(); ++i)
+        if (g_sim->particles()[i].material == MaterialType::Rock) {
+          inspect_idx = i;
+          break;
+        }
+    }
     ImGui::Separator();
+    showParticleInfo(inspect_idx);
+  }
 
-    // ── Playback controls ─────────────────────────────────────────────────
-    if (!g_debug_mode) {
-        if (ImGui::Button(g_running ? " Pause " : " Play  "))
-            g_running = !g_running;
-        ImGui::SameLine();
-        if (ImGui::Button("Step x1")) {
-            g_sim->step();
-            g_sim->updatePolyscope();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Step x10")) {
-            for (int i = 0; i < 10; ++i) g_sim->step();
-            g_sim->updatePolyscope();
-        }
-    }
+  // ── What to expect box ───────────────────────────────────────────────────
+  if (ImGui::CollapsingHeader("Expected behaviour guide")) {
+    ImGui::TextWrapped("Phase 1 preset: particles sit still (no gravity,\n"
+                       "  no stress). Verifies rendering.\n\n"
+                       "Phase 2 preset: gravity ON, stress OFF.\n"
+                       "  All materials fall and pile at bottom.\n"
+                       "  Layers interpenetrate - no pressure.\n\n"
+                       "Phase 3 preset: adds Tait pressure for all.\n"
+                       "  Layers resist compression but all flow\n"
+                       "  like fluids (no shear resistance).\n\n"
+                       "Phase 4 preset: full simulation.\n"
+                       "  Rock/soil resist shear (stiff elastic).\n"
+                       "  Sand flows to angle of repose (~35 deg).\n"
+                       "  Water sloshes, no frame-230 blow-up.\n\n"
+                       "Toggle F-reset OFF on water to see the\n"
+                       "  blow-up that Phase 4 fixes.\n\n"
+                       "Toggle Drucker-Prager OFF on sand to see\n"
+                       "  elastic vs plastic sand behaviour.");
+  }
 
-    if (ImGui::Button("Reset")) {
-        g_running = false;
-        g_sim->initialize();
-        g_sim->updatePolyscope();
-    }
-    ImGui::Separator();
+  ImGui::End();
 
-    // ── Debug / substep mode ──────────────────────────────────────────────
-    ImGui::Checkbox("Substep debug mode", &g_debug_mode);
-    if (g_debug_mode) {
-        g_running = false;
-        ImGui::TextColored(ImVec4(1,0.8f,0.2f,1), "Manual substep control:");
-
-        if (ImGui::Button("1. Clear grid")) {
-            g_sim->clearGrid();
-            ImGui::SetTooltip("Grid zeroed");
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("2. P2G")) {
-            g_sim->substep_P2G();
-            g_sim->updatePolyscope();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("3. Grid update")) {
-            g_sim->substep_gridUpdate();
-        }
-        if (ImGui::Button("4. G2P")) {
-            g_sim->substep_G2P();
-            g_sim->updatePolyscope();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("5. Advect")) {
-            g_sim->substep_advect();
-            g_sim->updatePolyscope();
-        }
-
-        ImGui::Separator();
-        ImGui::TextWrapped(
-            "Run substeps in order 1→5 to complete one timestep.\n"
-            "Inspect particle 0 after each to see what changed:");
-
-        static int inspect_idx = 0;
-        ImGui::InputInt("Particle index", &inspect_idx);
-        showParticleInfo(inspect_idx);
-    }
-
-    ImGui::Separator();
-
-    // ── What to expect ────────────────────────────────────────────────────
-    ImGui::TextWrapped(
-        "Phase 2: particles fall under gravity\n"
-        "and compress at the bottom.\n"
-        "No pressure yet — that's Phase 3.\n"
-        "Layers will interpenetrate for now.");
-
-    ImGui::End();
-
-    // ── Simulation tick ───────────────────────────────────────────────────
-    if (g_running && !g_debug_mode) {
-        g_sim->step();
-        g_sim->updatePolyscope();
-    }
+  // ── Tick ─────────────────────────────────────────────────────────────────
+  if (g_running) {
+    for (int i = 0; i < g_spf; ++i)
+      g_sim->step();
+    g_sim->updatePolyscope();
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 int main() {
-    SimParams params;
-    params.domain_w  = 10.0f;
-    params.domain_h  =  6.0f;
-    params.layer_pct =  0.20f;
-    params.ppc       =  4;
-    params.grid_nx   = 80;
-    params.grid_ny   = 48;
-    params.dt        = 2e-4f;
-    params.gravity   = -9.8f;
-    params.computeDerived();
+  SimParams params;
+  params.domain_w = 10.f;
+  params.domain_h = 6.f;
+  params.layer_pct = 0.20f;
+  params.ppc = 4;
+  params.grid_nx = 80;
+  params.grid_ny = 48;
+  params.dt = 5e-5f;
+  params.gravity = -9.8f;
+  params.computeDerived();
 
-    Simulation sim(params);
-    sim.initialize();
-    g_sim = &sim;
+  Simulation sim(params);
+  sim.initialize();
+  g_sim = &sim;
 
-    polyscope::init();
-    polyscope::options::programName     = "MPM Fluid – Phase 2";
-    polyscope::view::upDir              = polyscope::UpDir::YUp;
-    polyscope::view::style              = polyscope::NavigateStyle::Planar;
-    polyscope::options::groundPlaneMode = polyscope::GroundPlaneMode::None;
+  polyscope::init();
+  polyscope::options::programName = "MPM Debug: Phase 4";
+  polyscope::view::upDir = polyscope::UpDir::YUp;
+  polyscope::view::style = polyscope::NavigateStyle::Planar;
+  polyscope::options::groundPlaneMode = polyscope::GroundPlaneMode::None;
 
-    sim.registerPolyscope();
-
-    polyscope::view::lookAt(
-        {5.0, 3.0, 20.0},
-        {5.0, 3.0,  0.0},
-        {0.0, 1.0,  0.0}
-    );
-
-    polyscope::state::userCallback = uiCallback;
-    polyscope::show();
-    return 0;
+  sim.registerPolyscope();
+  polyscope::view::lookAt({5., 3., 20.}, {5., 3., 0.}, {0., 1., 0.});
+  polyscope::state::userCallback = uiCallback;
+  polyscope::show();
+  return 0;
 }
