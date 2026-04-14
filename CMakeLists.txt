@@ -16,9 +16,17 @@ FetchContent_Declare(eigen
 set(EIGEN_BUILD_DOC OFF CACHE BOOL "" FORCE)
 set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(eigen)
+
 add_executable(mpm_fluid src/main.cpp src/simulation.cpp)
 target_include_directories(mpm_fluid PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(mpm_fluid PRIVATE polyscope Eigen3::Eigen)
 target_compile_options(mpm_fluid PRIVATE
+  $<$<CONFIG:Release>:-O3 -march=native>
+  $<$<CONFIG:Debug>:-O0 -g>)
+
+  add_executable(mpm_elastic src/main_elastic_drop.cpp src/simulation_elastic_drop.cpp)
+target_include_directories(mpm_elastic PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(mpm_elastic PRIVATE polyscope Eigen3::Eigen)
+target_compile_options(mpm_elastic PRIVATE
   $<$<CONFIG:Release>:-O3 -march=native>
   $<$<CONFIG:Debug>:-O0 -g>)

@@ -1,4 +1,5 @@
 #include "imgui.h"
+#include "polyscope/curve_network.h"
 #include "polyscope/polyscope.h"
 #include "simulation.h"
 #include <iostream>
@@ -7,6 +8,24 @@
 static Simulation *g_sim = nullptr;
 static bool g_running = false;
 static int g_spf = 5;
+
+static void registerBoxBoundary(double xmin = -1.0, double xmax = 1.0,
+                                double ymin = 0.0, double ymax = 2.0) {
+  // 4 corners (z = 0 for 2D)
+  Eigen::MatrixXd nodes(4, 3);
+  nodes << xmin, ymin, 0, xmax, ymin, 0, xmax, ymax, 0, xmin, ymax, 0;
+
+  // 4 edges (connect corners)
+  Eigen::MatrixXi edges(4, 2);
+  edges << 0, 1, 1, 2, 2, 3, 3, 0;
+
+  // Register with Polyscope
+  auto *box = polyscope::registerCurveNetwork("box boundary", nodes, edges);
+
+  // Optional styling
+  box->setRadius(0.002);          // thickness of lines
+  box->setColor({0.0, 0.0, 0.0}); // black
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Preset helper: applies a named configuration to the toggles so the user
@@ -74,7 +93,7 @@ static void showParticleInfo(int idx) {
   const char *names[] = {"Water", "Soil", "Sand", "Rock"};
   const char *models[] = {"Fluid(Tait)", "FixedCorotated", "DruckerPrager",
                           "?"};
-  MaterialParams mp = defaultMaterialParams(p.material);
+  const MaterialParams &mp = g_sim->materialParams(p.material);
   int midx = (int)mp.model < 3 ? (int)mp.model : 3;
   ImGui::Text("material : %s  (%s)", names[(int)p.material], models[midx]);
   ImGui::Text("pos      : (%.3f, %.3f)", p.pos.x(), p.pos.y());
@@ -82,6 +101,22 @@ static void showParticleInfo(int idx) {
   ImGui::Text("J=det(F) : %.4f", J);
   ImGui::Text("F        : [[%.2f %.2f][%.2f %.2f]]", p.F(0, 0), p.F(0, 1),
               p.F(1, 0), p.F(1, 1));
+  if (p.material != MaterialType::Water) {
+    ImGui::Text("E        : %.3e", mp.youngs_modulus);
+    ImGui::Text("nu       : %.3f", mp.poisson_ratio);
+  }
+  if (p.material == MaterialType::Water) {
+    ImGui::Text("rho      : %.1f", mp.density0);
+    ImGui::Text("bulk     : %.3e", mp.bulk_modulus);
+    ImGui::Text("gamma    : %.3f", mp.gamma);
+    ImGui::Text("visc     : %.3e", mp.viscosity);
+  } else if (p.material == MaterialType::Sand) {
+    ImGui::Text("rho      : %.1f", mp.density0);
+    ImGui::Text("phi      : %.2f", mp.friction_angle);
+    ImGui::Text("cohesion : %.3e", mp.cohesion);
+  } else {
+    ImGui::Text("rho      : %.1f", mp.density0);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -230,6 +265,66 @@ void uiCallback() {
     ImGui::Unindent(8.f);
   }
 
+  // ── Runtime-editable material parameters ─────────────────────────────────
+  if (ImGui::CollapsingHeader("Material parameters",
+                              ImGuiTreeNodeFlags_DefaultOpen)) {
+    SimParams &p = g_sim->paramsMutable();
+
+    auto drawElasticControls = [](const char *prefix, MaterialParams &mp) {
+      ImGui::PushID(prefix);
+      ImGui::InputFloat("Density", &mp.density0);
+      ImGui::InputFloat("Young's modulus", &mp.youngs_modulus, 0.f, 0.f,
+                        "%.3e");
+      ImGui::SliderFloat("Poisson ratio", &mp.poisson_ratio, 0.0f, 0.45f);
+      mp.density0 = std::max(mp.density0, 1.f);
+      mp.youngs_modulus = std::max(mp.youngs_modulus, 1.f);
+      ImGui::Text("mu      = %.3e", mp.mu);
+      ImGui::Text("lambda  = %.3e", mp.lambda_lame);
+      ImGui::PopID();
+    };
+
+    if (ImGui::TreeNode("Water")) {
+      MaterialParams &mp = p.water_params;
+      ImGui::InputFloat("Density##water", &mp.density0);
+      ImGui::InputFloat("Bulk modulus##water", &mp.bulk_modulus, 0.f, 0.f,
+                        "%.3e");
+      ImGui::InputFloat("Gamma##water", &mp.gamma);
+      ImGui::InputFloat("Viscosity##water", &mp.viscosity, 0.f, 0.f, "%.3e");
+      mp.density0 = std::max(mp.density0, 1.f);
+      mp.bulk_modulus = std::max(mp.bulk_modulus, 1.f);
+      mp.gamma = std::max(mp.gamma, 0.1f);
+      mp.viscosity = std::max(mp.viscosity, 0.f);
+      ImGui::TreePop();
+    }
+
+    if (ImGui::TreeNode("Soil")) {
+      drawElasticControls("soil", p.soil_params);
+      ImGui::TreePop();
+    }
+
+    if (ImGui::TreeNode("Sand")) {
+      MaterialParams &mp = p.sand_params;
+      drawElasticControls("sand", mp);
+      ImGui::InputFloat("Friction angle", &mp.friction_angle);
+      ImGui::InputFloat("Cohesion", &mp.cohesion, 0.f, 0.f, "%.3e");
+      mp.friction_angle = std::clamp(mp.friction_angle, 0.f, 89.f);
+      mp.cohesion = std::max(mp.cohesion, 0.f);
+      ImGui::Text("alpha_dp = %.3e", mp.alpha_dp);
+      ImGui::TreePop();
+    }
+
+    if (ImGui::TreeNode("Rock")) {
+      drawElasticControls("rock", p.rock_params);
+      ImGui::TreePop();
+    }
+
+    p.computeDerived();
+    ImGui::TextWrapped(
+        "These values are now read directly by the constitutive-law code. "
+        "Elastic/plastic behavior changes immediately; after changing density, "
+        "press Reset so particle masses are rebuilt from the new densities.");
+  }
+
   // ── Boundary condition toggles ────────────────────────────────────────────
   if (ImGui::CollapsingHeader("Boundary conditions")) {
     ImGui::Indent(8.f);
@@ -331,6 +426,7 @@ int main() {
   g_sim = &sim;
 
   polyscope::init();
+  registerBoxBoundary(0.f, params.domain_w, 0.f, params.domain_h);
   polyscope::options::programName = "MPM Debug: Phase 4";
   polyscope::view::upDir = polyscope::UpDir::YUp;
   polyscope::view::style = polyscope::NavigateStyle::Planar;

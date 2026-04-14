@@ -65,7 +65,15 @@ public:
 
     const std::vector<Particle>& particles() const { return particles_; }
     const SimParams&             params()    const { return params_;    }
+    SimParams&                   paramsMutable()   { return params_;    }
     int                          frameCount()const { return frame_;     }
+
+    // Helper: fetch the currently-active runtime-editable parameter block for
+    // a given material. This keeps the constitutive-law code compact and makes
+    // it explicit that the UI, not defaultMaterialParams(), is the source of
+    // truth once the simulation has started.
+    const MaterialParams& materialParams(MaterialType m) const;
+    MaterialParams&       materialParamsMutable(MaterialType m);
 
     // The UI writes directly to this struct every frame
     SimToggles toggles;

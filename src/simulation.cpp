@@ -10,6 +10,34 @@ Simulation::Simulation(SimParams params) : params_(std::move(params)) {
   grid_.resize(params_.grid_nx * params_.grid_ny);
 }
 
+const MaterialParams &Simulation::materialParams(MaterialType m) const {
+  switch (m) {
+  case MaterialType::Water:
+    return params_.water_params;
+  case MaterialType::Soil:
+    return params_.soil_params;
+  case MaterialType::Sand:
+    return params_.sand_params;
+  case MaterialType::Rock:
+    return params_.rock_params;
+  }
+  return params_.water_params;
+}
+
+MaterialParams &Simulation::materialParamsMutable(MaterialType m) {
+  switch (m) {
+  case MaterialType::Water:
+    return params_.water_params;
+  case MaterialType::Soil:
+    return params_.soil_params;
+  case MaterialType::Sand:
+    return params_.sand_params;
+  case MaterialType::Rock:
+    return params_.rock_params;
+  }
+  return params_.water_params;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  initialize()
 // ─────────────────────────────────────────────────────────────────────────────
@@ -48,7 +76,7 @@ void Simulation::initialize() {
   };
   int pidx = 0;
   for (const auto &l : layers) {
-    MaterialParams mp = defaultMaterialParams(l.mat);
+    const MaterialParams &mp = materialParams(l.mat);
     for (float y = l.y_lo + py * 0.5f; y < l.y_hi; y += py)
       for (float x = px * 0.5f; x < W; x += px) {
         Particle p;
@@ -127,7 +155,7 @@ Simulation::stressDruckerPrager(const Particle &p,
 //  kirchhoffStress()  — dispatcher with per-material toggle checks
 // ─────────────────────────────────────────────────────────────────────────────
 Eigen::Matrix2f Simulation::kirchhoffStress(const Particle &p) const {
-  MaterialParams mp = defaultMaterialParams(p.material);
+  const MaterialParams &mp = materialParams(p.material);
 
   switch (mp.model) {
   case ConstitutiveModel::WeaklyCompressibleFluid:
@@ -301,7 +329,7 @@ void Simulation::substep_G2P() {
     p.C = D_inv * C_new;
     p.F = (Eigen::Matrix2f::Identity() + dt * p.C) * p.F;
 
-    MaterialParams mp = defaultMaterialParams(p.material);
+    const MaterialParams &mp = materialParams(p.material);
 
     if (mp.model == ConstitutiveModel::WeaklyCompressibleFluid) {
       // F-reset lives in stressFluid; call it here so reset happens
