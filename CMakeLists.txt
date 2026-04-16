@@ -30,3 +30,27 @@ target_link_libraries(mpm_elastic PRIVATE polyscope Eigen3::Eigen)
 target_compile_options(mpm_elastic PRIVATE
   $<$<CONFIG:Release>:-O3 -march=native>
   $<$<CONFIG:Debug>:-O0 -g>)
+
+
+    add_executable(mpm_layered src/main_layered_drop.cpp src/simulation_layered_drop.cpp)
+target_include_directories(mpm_layered PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(mpm_layered PRIVATE polyscope Eigen3::Eigen)
+target_compile_options(mpm_layered PRIVATE
+  $<$<CONFIG:Release>:-O3 -march=native>
+  $<$<CONFIG:Debug>:-O0 -g>)
+
+
+    add_executable(2layer src/main_two_layer_drop.cpp src/simulation_two_layer_drop.cpp)
+target_include_directories(2layer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(2layer PRIVATE polyscope Eigen3::Eigen)
+target_compile_options(2layer PRIVATE
+  $<$<CONFIG:Release>:-O3 -march=native>
+  $<$<CONFIG:Debug>:-O0 -g>)
+
+
+      add_executable(blobs src/main_many_blob_demo.cpp src/simulation_many_blob_demo.cpp)
+target_include_directories(blobs PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(blobs PRIVATE polyscope Eigen3::Eigen)
+target_compile_options(blobs PRIVATE
+  $<$<CONFIG:Release>:-O3 -march=native>
+  $<$<CONFIG:Debug>:-O0 -g>)

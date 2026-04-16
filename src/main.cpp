@@ -44,7 +44,6 @@ static void applyPreset(SimToggles &t, const char *name) {
     t.enable_stress = false;
     t.enable_viscosity = false;
     t.model_water_tait = false;
-    t.model_water_freset = false;
     t.model_soil_elastic = false;
     t.model_sand_plastic = false;
     t.model_rock_elastic = false;
@@ -57,7 +56,6 @@ static void applyPreset(SimToggles &t, const char *name) {
     t.enable_stress = false;
     t.enable_viscosity = false;
     t.model_water_tait = false;
-    t.model_water_freset = true; // keep F-reset to prevent NaN
     t.model_soil_elastic = false;
     t.model_sand_plastic = false;
     t.model_rock_elastic = false;
@@ -69,7 +67,6 @@ static void applyPreset(SimToggles &t, const char *name) {
     t.enable_stress = true;
     t.enable_viscosity = true;
     t.model_water_tait = true;
-    t.model_water_freset = true;
     t.model_soil_elastic = false; // soil acts as fluid
     t.model_sand_plastic = false; // sand acts as fluid, no yield surface
     t.model_rock_elastic = false; // rock acts as fluid
@@ -234,12 +231,6 @@ void uiCallback() {
     if (ImGui::IsItemHovered())
       ImGui::SetTooltip("p = k*(J^{-gamma}-1)\n"
                         "Off = water is pressureless gas.");
-    ImGui::Checkbox("F-reset##water", &t.model_water_freset);
-    if (ImGui::IsItemHovered())
-      ImGui::SetTooltip("Resets F to sqrt(J)*I each step.\n"
-                        "Off = F accumulates shear error -> blow-up\n"
-                        "at frame ~230. Turn off to see the bug.");
-
     ImGui::Spacing();
     ImGui::TextDisabled("Soil (green)");
     ImGui::Checkbox("Fixed-corotated elastic##soil", &t.model_soil_elastic);
@@ -391,9 +382,7 @@ void uiCallback() {
                        "Phase 4 preset: full simulation.\n"
                        "  Rock/soil resist shear (stiff elastic).\n"
                        "  Sand flows to angle of repose (~35 deg).\n"
-                       "  Water sloshes, no frame-230 blow-up.\n\n"
-                       "Toggle F-reset OFF on water to see the\n"
-                       "  blow-up that Phase 4 fixes.\n\n"
+                       "  Water sloshes.\n\n"
                        "Toggle Drucker-Prager OFF on sand to see\n"
                        "  elastic vs plastic sand behaviour.");
   }

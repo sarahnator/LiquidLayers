@@ -1,36 +1,28 @@
 #pragma once
+
 #include "types.h"
 #include <array>
 #include <vector>
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  SimToggles
+//  SimTogglesLayeredDrop
 //
-//  Every runtime feature flag lives here.  main.cpp owns one instance and
-//  passes a pointer to Simulation so the UI can flip toggles mid-run without
-//  recompiling.  Defaults correspond to the full Phase 4 behaviour.
+//  Runtime feature flags for the layered-drop debugging scene. This keeps the
+//  same constitutive model toggles as the full MPM debug scene, but simplifies
+//  the initial condition to a single falling multilayer block in a box.
 // ─────────────────────────────────────────────────────────────────────────────
-struct SimToggles {
-  // ── Phase 1 ───────────────────────────────────────────────────────────────
-  bool render_particles = true; // draw the point cloud at all
+struct SimTogglesLayeredDrop {
+  bool render_particles = true;
 
-  // ── Phase 2 ───────────────────────────────────────────────────────────────
-  // (P2G / G2P / advect are always on — turning them off would stop the sim)
+  bool enable_gravity = true;
+  bool enable_stress = true;
+  bool enable_viscosity = true;
 
-  // ── Phase 3 ───────────────────────────────────────────────────────────────
-  bool enable_gravity = true;   // add  m*g  to grid node forces
-  bool enable_stress = true;    // scatter  -vol*tau*grad_w  to grid
-  bool enable_viscosity = true; // include viscous term in fluid stress
+  bool model_water_tait = true;
+  bool model_soil_elastic = true;
+  bool model_sand_plastic = true;
+  bool model_rock_elastic = true;
 
-  // ── Phase 4 per-material constitutive model switches ─────────────────────
-  // When a model is DISABLED, the material falls back to a pressureless gas
-  // (zero stress).  This lets you isolate one material at a time.
-  bool model_water_tait = true;   // Tait EOS
-  bool model_soil_elastic = true; // fixed-corotated for soil
-  bool model_sand_plastic = true; // Drucker-Prager projection for sand
-  bool model_rock_elastic = true; // fixed-corotated for rock
-
-  // ── Boundary conditions ───────────────────────────────────────────────────
   bool bc_left = true;
   bool bc_right = true;
   bool bc_bottom = true;
@@ -38,11 +30,27 @@ struct SimToggles {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Simulation
+//  LayeredDropSceneParams
+//
+//  Extra scene parameters beyond the generic MPM SimParams. These control the
+//  position and dimensions of the dropped multilayer block.
 // ─────────────────────────────────────────────────────────────────────────────
-class Simulation {
+struct LayeredDropSceneParams {
+  float block_w = 1.2f;
+  float block_h = 1.6f;
+  float block_center_x = 5.0f;
+  float block_center_y = 4.7f;
+
+  // Optional empty spacing inserted between the four material bands inside the
+  // dropped block. A small nonzero gap makes rearrangement and splash / spill
+  // behavior easier to observe because the layers do not begin in perfectly
+  // bonded contact.
+  float layer_gap = 0.0f;
+};
+
+class LayeredDropSimulation {
 public:
-  explicit Simulation(SimParams params = {});
+  explicit LayeredDropSimulation(SimParams params = {});
 
   void initialize();
   void step();
@@ -64,27 +72,34 @@ public:
   const std::vector<Particle> &particles() const { return particles_; }
   const SimParams &params() const { return params_; }
   SimParams &paramsMutable() { return params_; }
-  int frameCount() const { return frame_; }
 
-  // Helper: fetch the currently-active runtime-editable parameter block for
-  // a given material. This keeps the constitutive-law code compact and makes
-  // it explicit that the UI, not defaultMaterialParams(), is the source of
-  // truth once the simulation has started.
+  const LayeredDropSceneParams &sceneParams() const { return scene_params_; }
+  LayeredDropSceneParams &sceneParamsMutable() { return scene_params_; }
+
   const MaterialParams &materialParams(MaterialType m) const;
   MaterialParams &materialParamsMutable(MaterialType m);
 
-  // The UI writes directly to this struct every frame
-  SimToggles toggles;
+  int frameCount() const { return frame_; }
+
+  SimTogglesLayeredDrop toggles;
 
 private:
   SimParams params_;
+  LayeredDropSceneParams scene_params_;
   std::vector<Particle> particles_;
   std::vector<GridNode> grid_;
   int frame_ = 0;
 
-  static constexpr const char *kCloudName = "particles";
+  MaterialParams water_params_ = defaultMaterialParams(MaterialType::Water);
+  MaterialParams soil_params_ = defaultMaterialParams(MaterialType::Soil);
+  MaterialParams sand_params_ = defaultMaterialParams(MaterialType::Sand);
+  MaterialParams rock_params_ = defaultMaterialParams(MaterialType::Rock);
+
+  static constexpr const char *kCloudName = "layered_drop_particles";
+
   void buildRenderArrays(std::vector<std::array<double, 3>> &,
                          std::vector<std::array<double, 3>> &) const;
+  void addLayeredBlock(float x_min, float x_max, float y_min, float y_max);
 
   Eigen::Matrix2f kirchhoffStress(const Particle &p) const;
   Eigen::Matrix2f stressFluid(const Particle &p,

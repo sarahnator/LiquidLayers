@@ -1,6 +1,6 @@
-#include "simulation.h"
 #include "polyscope/point_cloud.h"
 #include "polyscope/polyscope.h"
+#include "simulation.h"
 #include <algorithm>
 #include <cmath>
 #include <iostream>
@@ -100,6 +100,8 @@ void Simulation::initialize() {
 //  Toggle checks:
 //    toggles.model_water_tait   — if off, returns zero (pressureless gas)
 //    toggles.enable_viscosity   — if off, skips viscous term
+//    toggles.model_water_freset — if off, skips the F-reset (will blow up
+//                                 eventually, but useful to see the difference)
 // ─────────────────────────────────────────────────────────────────────────────
 Eigen::Matrix2f Simulation::stressFluid(const Particle &p_const,
                                         const MaterialParams &mp) const {
@@ -107,6 +109,10 @@ Eigen::Matrix2f Simulation::stressFluid(const Particle &p_const,
 
   float J = p.F.determinant();
   J = std::clamp(J, 0.6f, 1.4f);
+
+  // // F-reset — can be disabled to demonstrate the frame-230 blow-up
+  // if (toggles.model_water_freset)
+  //   p.F = std::sqrt(J) * Eigen::Matrix2f::Identity();
 
   if (!toggles.model_water_tait)
     return Eigen::Matrix2f::Zero(); // Phase 1/2 fallback: no pressure
@@ -153,7 +159,7 @@ Eigen::Matrix2f Simulation::kirchhoffStress(const Particle &p) const {
 
   switch (mp.model) {
   case ConstitutiveModel::WeaklyCompressibleFluid:
-    // stressFluid handles its own toggle internally
+    // stressFluid handles its own toggle internally (it also does F-reset)
     return stressFluid(p, mp);
 
   case ConstitutiveModel::FixedCorotated:
@@ -297,6 +303,8 @@ void Simulation::substep_gridUpdate() {
 //
 //  Toggle checks:
 //    toggles.model_sand_plastic — Drucker-Prager projection for sand
+//    (F-reset for water is inside stressFluid which is called from gridUpdate,
+//     but we also call it here to ensure the reset happens each step)
 // ─────────────────────────────────────────────────────────────────────────────
 void Simulation::substep_G2P() {
   const float dx = params_.dx, D_inv = params_.D_inv, dt = params_.dt;
@@ -323,7 +331,14 @@ void Simulation::substep_G2P() {
 
     const MaterialParams &mp = materialParams(p.material);
 
-    if (mp.model == ConstitutiveModel::DruckerPrager) {
+    if (mp.model == ConstitutiveModel::WeaklyCompressibleFluid) {
+      // F-reset lives in stressFluid; call it here so reset happens
+      // even on frames where stress was disabled during gridUpdate
+      // if (toggles.model_water_freset) {
+      //   float J = std::clamp(p.F.determinant(), 0.6f, 1.4f);
+      //   p.F = std::sqrt(J) * Eigen::Matrix2f::Identity();
+      // }
+    } else if (mp.model == ConstitutiveModel::DruckerPrager) {
       if (toggles.model_sand_plastic)
         projectDruckerPrager(p, mp);
     }
