@@ -1,0 +1,489 @@
+// =============================================================================
+//  main_mpm_fluid.cpp  (v2)
+//
+//  UI changes from v1:
+//    • "Add fluid" button registers a new FluidParams in the runtime registry.
+//    • "Remove fluid" button (with particle-count safety warning).
+//    • "Drop block" panel lets the user choose which two fluids fill the next
+//      block, set the block geometry, and toggle invert_bands.
+//    • RT preset now correctly passes invert_bands=true so the heavy fluid
+//      (registered as bottom_fluid) physically starts on TOP.
+// =============================================================================
+
+#include "imgui.h"
+#include "mpm_fluid.h"
+#include "polyscope/curve_network.h"
+#include "polyscope/point_cloud.h"
+#include "polyscope/polyscope.h"
+#include <algorithm>
+#include <string>
+
+static FluidSimulation *g_sim = nullptr;
+static bool g_running = false;
+static int g_spf = 5;
+static const char *kCloud = "particles";
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Preset builders
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Returns a BlockSpec configured for a Rayleigh-Taylor unstable drop.
+// Fluid 0 = light (blue),  Fluid 1 = heavy (gray).
+// invert_bands = true  →  heavy fluid starts on TOP (unstable).
+static BlockSpec makeRTBlock(const SimParams &p) {
+  BlockSpec b;
+  b.x_min = p.domain_w * 0.5f - 2.25f;
+  b.x_max = p.domain_w * 0.5f + 2.25f;
+  b.y_min = p.domain_h * 0.5f - 1.6f;
+  b.y_max = p.domain_h * 0.5f + 1.6f;
+  b.layer_gap = 0.02f;
+  b.bottom_fluid = 1;    // heavy → but will be inverted to the top
+  b.top_fluid = 0;       // light → but will be inverted to the bottom
+  b.invert_bands = true; // heavy goes on TOP: RT unstable configuration
+  return b;
+}
+
+static BlockSpec makeStableBlock(const SimParams &p) {
+  BlockSpec b;
+  b.x_min = p.domain_w * 0.5f - 2.25f;
+  b.x_max = p.domain_w * 0.5f + 2.25f;
+  b.y_min = p.domain_h * 0.5f - 1.6f;
+  b.y_max = p.domain_h * 0.5f + 1.6f;
+  b.layer_gap = 0.02f;
+  b.bottom_fluid = 1; // heavy on bottom: stable
+  b.top_fluid = 0;    // light on top
+  b.invert_bands = false;
+  return b;
+}
+
+static void applyRTPreset(FluidSimulation &sim) {
+  // Register exactly two fluids; clear any previous registry.
+  while (sim.numFluids() > 0)
+    sim.removeFluid(0);
+
+  FluidParams light;
+  light.name = "Light (blue)";
+  light.density0 = 700.f;
+  light.bulk_modulus = 120.f;
+  light.gamma = 4.f;
+  light.viscosity = 0.006f;
+  light.color = {0.20f, 0.55f, 0.95f};
+  sim.addFluid(light); // FluidID 0
+
+  FluidParams heavy;
+  heavy.name = "Heavy (gray)";
+  heavy.density0 = 2200.f;
+  heavy.bulk_modulus = 260.f;
+  heavy.gamma = 4.f;
+  heavy.viscosity = 0.030f;
+  heavy.color = {0.42f, 0.42f, 0.46f};
+  sim.addFluid(heavy); // FluidID 1
+
+  // Set dt from CFL using the new fluid speeds.
+  SimParams &sp = sim.paramsMutable();
+  //   sp.dt = sp.estimateDt(sim.allFluids());
+}
+
+static void applyStablePreset(FluidSimulation &sim) {
+  while (sim.numFluids() > 0)
+    sim.removeFluid(0);
+
+  FluidParams light;
+  light.name = "Light (blue)";
+  light.density0 = 1000.f;
+  light.bulk_modulus = 140.f;
+  light.gamma = 4.f;
+  light.viscosity = 0.010f;
+  light.color = {0.12f, 0.50f, 0.95f};
+  sim.addFluid(light);
+
+  FluidParams heavy;
+  heavy.name = "Heavy (gray)";
+  heavy.density0 = 2200.f;
+  heavy.bulk_modulus = 260.f;
+  heavy.gamma = 4.f;
+  heavy.viscosity = 0.030f;
+  heavy.color = {0.42f, 0.42f, 0.46f};
+  sim.addFluid(heavy);
+
+  SimParams &sp = sim.paramsMutable();
+  sp.dt = sp.estimateDt(sim.allFluids());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Polyscope helpers
+// ─────────────────────────────────────────────────────────────────────────────
+static void registerDomainBox(const SimParams &sp) {
+  Eigen::MatrixXd nodes(4, 3);
+  nodes << 0, 0, 0, sp.domain_w, 0, 0, sp.domain_w, sp.domain_h, 0, 0,
+      sp.domain_h, 0;
+  Eigen::MatrixXi edges(4, 2);
+  edges << 0, 1, 1, 2, 2, 3, 3, 0;
+  auto *box = polyscope::registerCurveNetwork("domain", nodes, edges);
+  box->setRadius(0.002);
+  box->setColor({0, 0, 0});
+}
+
+static void rebuildCloud(const FluidSimulation &sim) {
+  const auto &ps = sim.particles();
+  std::vector<std::array<double, 3>> pts(ps.size()), cols(ps.size());
+  for (size_t i = 0; i < ps.size(); ++i) {
+    pts[i] = {(double)ps[i].pos.x(), (double)ps[i].pos.y(), 0.0};
+    // Guard against stale FluidID after a removeFluid call
+    if (ps[i].fluid < sim.numFluids()) {
+      const auto &c = sim.fluidParams(ps[i].fluid).color;
+      cols[i] = {(double)c[0], (double)c[1], (double)c[2]};
+    } else {
+      cols[i] = {1, 0, 1}; // magenta = stale
+    }
+  }
+  polyscope::removeStructure(kCloud, false);
+  auto *cloud = polyscope::registerPointCloud(kCloud, pts);
+  cloud->setPointRadius(0.0035);
+  cloud->setPointRenderMode(polyscope::PointRenderMode::Sphere);
+  cloud->setMaterial("flat");
+  cloud->addColorQuantity("color", cols)->setEnabled(true);
+}
+
+static void updateCloud(const FluidSimulation &sim) {
+  const auto &ps = sim.particles();
+  std::vector<std::array<double, 3>> pts(ps.size()), cols(ps.size());
+  for (size_t i = 0; i < ps.size(); ++i) {
+    pts[i] = {(double)ps[i].pos.x(), (double)ps[i].pos.y(), 0.0};
+    if (ps[i].fluid < sim.numFluids()) {
+      const auto &c = sim.fluidParams(ps[i].fluid).color;
+      cols[i] = {(double)c[0], (double)c[1], (double)c[2]};
+    } else {
+      cols[i] = {1, 0, 1};
+    }
+  }
+  auto *cloud = polyscope::getPointCloud(kCloud);
+  cloud->updatePointPositions(pts);
+  cloud->addColorQuantity("color", cols)->setEnabled(true);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  UI state for the "drop block" panel
+// ─────────────────────────────────────────────────────────────────────────────
+static BlockSpec g_pending_block;
+static bool g_pending_inited = false;
+
+static void initPendingBlock(const SimParams &sp) {
+  g_pending_block = makeRTBlock(sp);
+  g_pending_inited = true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  showFluidEditor() — inline material panel for one fluid slot
+// ─────────────────────────────────────────────────────────────────────────────
+static void showFluidEditor(FluidParams &fp, int id) {
+  // Label uses the stored name
+  char lbl[64];
+  snprintf(lbl, sizeof(lbl), "Fluid %d: %s", id, fp.name.c_str());
+  if (!ImGui::TreeNode(lbl))
+    return;
+  ImGui::PushID(id);
+
+  static char name_buf[64];
+  strncpy(name_buf, fp.name.c_str(), sizeof(name_buf) - 1);
+  if (ImGui::InputText("Name", name_buf, sizeof(name_buf)))
+    fp.name = name_buf;
+
+  ImGui::ColorEdit3("Color", fp.color.data());
+  ImGui::InputFloat("Density (ρ₀)", &fp.density0, 0, 0, "%.1f");
+  ImGui::InputFloat("Bulk mod (K)", &fp.bulk_modulus, 0, 0, "%.3e");
+  ImGui::SliderFloat("Gamma (γ)", &fp.gamma, 1.f, 10.f);
+  ImGui::SliderFloat("Viscosity (μ)", &fp.viscosity, 0.f, 1.f);
+
+  fp.density0 = std::max(fp.density0, 1.f);
+  fp.bulk_modulus = std::max(fp.bulk_modulus, 1e-3f);
+  fp.gamma = std::clamp(fp.gamma, 1.f, 12.f);
+  fp.viscosity = std::max(fp.viscosity, 0.f);
+  fp.computeDerived();
+  ImGui::Text("Wave speed c₀ = %.2f m/s", fp.c0);
+
+  ImGui::PopID();
+  ImGui::TreePop();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  uiCallback()
+// ─────────────────────────────────────────────────────────────────────────────
+void uiCallback() {
+  ImGui::SetNextWindowPos({320.f, 10.f}, ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize({450.f, 900.f}, ImGuiCond_FirstUseEver);
+  ImGui::Begin("Two-Fluid MPM");
+
+  // ── Status ────────────────────────────────────────────────────────────────
+  ImGui::Text("Particles : %zu", g_sim->particles().size());
+  ImGui::Text("Frame     : %d", g_sim->frame());
+  ImGui::Text("dt        : %.2e s", g_sim->params().dt);
+  ImGui::Text("Fluids    : %d", g_sim->numFluids());
+  ImGui::Separator();
+
+  // ── Playback ──────────────────────────────────────────────────────────────
+  if (ImGui::Button(g_running ? "Pause" : "Play"))
+    g_running = !g_running;
+  ImGui::SameLine();
+  if (ImGui::Button("Step×1")) {
+    g_sim->step();
+    updateCloud(*g_sim);
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("Step×20")) {
+    for (int i = 0; i < 20; ++i)
+      g_sim->step();
+    updateCloud(*g_sim);
+  }
+  ImGui::SliderInt("Steps/frame", &g_spf, 1, 30);
+  ImGui::Separator();
+
+  // ── Presets ───────────────────────────────────────────────────────────────
+  ImGui::TextDisabled("── Presets ──");
+  if (ImGui::Button("Rayleigh-Taylor (unstable, heavy on top)")) {
+    g_running = false;
+    applyRTPreset(*g_sim);
+    g_sim->initialize(makeRTBlock(g_sim->params()));
+    rebuildCloud(*g_sim);
+    initPendingBlock(g_sim->params());
+  }
+  if (ImGui::Button("Stable drop (heavy on bottom)")) {
+    g_running = false;
+    applyStablePreset(*g_sim);
+    g_sim->initialize(makeStableBlock(g_sim->params()));
+    rebuildCloud(*g_sim);
+    initPendingBlock(g_sim->params());
+  }
+  if (ImGui::Button("Reset (same fluids, same block)")) {
+    g_running = false;
+    g_sim->initialize(g_pending_block);
+    rebuildCloud(*g_sim);
+  }
+  ImGui::Separator();
+
+  // ── Simulation parameters ─────────────────────────────────────────────────
+  if (ImGui::CollapsingHeader("Simulation parameters")) {
+    SimParams &sp = g_sim->paramsMutable();
+    ImGui::InputFloat("dt [s]", &sp.dt, 0, 0, "%.2e");
+    ImGui::InputFloat("gravity", &sp.gravity);
+    sp.dt = std::max(sp.dt, 1e-7f);
+
+    float cfl = sp.estimateDt(g_sim->allFluids());
+    ImGui::Text("CFL dt: %.2e s", cfl);
+    // ImGui::SameLine();
+    // if (ImGui::Button("Use CFL dt")) sp.dt = cfl;
+  }
+
+  // ── Fluid registry ────────────────────────────────────────────────────────
+  if (ImGui::CollapsingHeader("Fluid registry",
+                              ImGuiTreeNodeFlags_DefaultOpen)) {
+
+    ImGui::TextWrapped(
+        "Each registered fluid type has a FluidID (0-based index).  "
+        "Particles keep their ID even if you edit parameters.  "
+        "Removing a fluid remaps IDs above it downward.");
+
+    for (int id = 0; id < g_sim->numFluids(); ++id) {
+      showFluidEditor(g_sim->fluidParamsMutable((FluidID)id), id);
+    }
+
+    // ── Add fluid ─────────────────────────────────────────────────────────
+    ImGui::Spacing();
+    if (g_sim->numFluids() < kMaxFluids) {
+      if (ImGui::Button("+ Add new fluid")) {
+        FluidParams nf;
+        nf.name = "New fluid " + std::to_string(g_sim->numFluids());
+        // Give it a random-ish colour so it's visually distinct
+        float hue = (float)g_sim->numFluids() * 0.618034f; // golden ratio
+        hue -= std::floor(hue);
+        // Simple HSV→RGB for h in [0,1), s=0.7, v=0.9
+        float h6 = hue * 6.f;
+        int hi = (int)h6;
+        float f = h6 - hi, p = 0.9f * 0.3f, q = 0.9f * (1 - (0.7f * f)),
+              t = 0.9f * (1 - 0.7f * (1 - f));
+        switch (hi % 6) {
+        case 0:
+          nf.color = {0.9f, t, p};
+          break;
+        case 1:
+          nf.color = {q, 0.9f, p};
+          break;
+        case 2:
+          nf.color = {p, 0.9f, t};
+          break;
+        case 3:
+          nf.color = {p, q, 0.9f};
+          break;
+        case 4:
+          nf.color = {t, p, 0.9f};
+          break;
+        default:
+          nf.color = {0.9f, p, q};
+          break;
+        }
+        int new_id = g_sim->addFluid(nf);
+        if (new_id >= 0)
+          std::cout << "[UI] Added fluid " << new_id << "\n";
+      }
+    } else {
+      ImGui::TextDisabled("(registry full: %d/%d)", g_sim->numFluids(),
+                          kMaxFluids);
+    }
+
+    // ── Remove fluid ──────────────────────────────────────────────────────
+    if (g_sim->numFluids() > 1) {
+      ImGui::SameLine();
+      static int remove_id = 0;
+      ImGui::SetNextItemWidth(60.f);
+      ImGui::InputInt("##rmid", &remove_id, 0);
+      remove_id = std::clamp(remove_id, 0, g_sim->numFluids() - 1);
+      ImGui::SameLine();
+      int count = g_sim->particleCountForFluid((FluidID)remove_id);
+      char rm_lbl[64];
+      snprintf(rm_lbl, sizeof(rm_lbl), "Remove fluid %d (%d particles)",
+               remove_id, count);
+      bool danger = count > 0;
+      if (danger)
+        ImGui::PushStyleColor(ImGuiCol_Button, {0.7f, 0.2f, 0.2f, 1.f});
+      if (ImGui::Button(rm_lbl)) {
+        g_sim->removeFluid((FluidID)remove_id);
+        remove_id = std::clamp(remove_id, 0, g_sim->numFluids() - 1);
+        rebuildCloud(*g_sim);
+      }
+      if (danger)
+        ImGui::PopStyleColor();
+      if (danger)
+        ImGui::TextColored({1, 0.5f, 0.5f, 1},
+                           "Warning: %d live particles use this fluid. "
+                           "They will be remapped to ID %d after removal.",
+                           count, remove_id);
+    }
+  }
+
+  // ── Drop block panel ──────────────────────────────────────────────────────
+  if (ImGui::CollapsingHeader("Drop a block", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (!g_pending_inited)
+      initPendingBlock(g_sim->params());
+    BlockSpec &b = g_pending_block;
+
+    ImGui::InputFloat("x min", &b.x_min);
+    ImGui::SameLine();
+    ImGui::InputFloat("x max", &b.x_max);
+    ImGui::InputFloat("y min", &b.y_min);
+    ImGui::SameLine();
+    ImGui::InputFloat("y max", &b.y_max);
+    ImGui::SliderFloat("layer gap", &b.layer_gap, 0.f, 0.1f);
+
+    // Combo boxes for which fluid fills each half
+    int nf = g_sim->numFluids();
+    // Build name list for combo
+    std::vector<const char *> fnames;
+    for (int i = 0; i < nf; ++i)
+      fnames.push_back(g_sim->fluidParams((FluidID)i).name.c_str());
+    fnames.push_back(nullptr); // sentinel
+
+    int bot = (int)b.bottom_fluid, top = (int)b.top_fluid;
+    ImGui::Combo("Bottom fluid", &bot, fnames.data(), nf);
+    ImGui::Combo("Top fluid", &top, fnames.data(), nf);
+    b.bottom_fluid = (FluidID)std::clamp(bot, 0, nf - 1);
+    b.top_fluid = (FluidID)std::clamp(top, 0, nf - 1);
+
+    ImGui::Checkbox("Invert bands (put 'bottom' fluid on top)",
+                    &b.invert_bands);
+    ImGui::TextWrapped(
+        "Tip: to get RT instability, assign the denser fluid as 'bottom fluid' "
+        "and check 'Invert bands' so it starts physically on top.");
+
+    // Clamp geometry to domain
+    const SimParams &sp = g_sim->params();
+    b.x_min = std::clamp(b.x_min, 0.001f, b.x_max - 0.01f);
+    b.x_max = std::clamp(b.x_max, b.x_min + 0.01f, sp.domain_w - 0.001f);
+    b.y_min = std::clamp(b.y_min, 0.001f, b.y_max - 0.01f);
+    b.y_max = std::clamp(b.y_max, b.y_min + 0.01f, sp.domain_h - 0.001f);
+
+    if (ImGui::Button("Drop block (adds to existing)")) {
+      g_sim->addBlock(b);
+      rebuildCloud(*g_sim);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Replace all with this block")) {
+      g_sim->clearParticles();
+      g_sim->addBlock(b);
+      rebuildCloud(*g_sim);
+    }
+  }
+
+  // ── Particle inspector ────────────────────────────────────────────────────
+  if (ImGui::CollapsingHeader("Particle inspector")) {
+    static int idx = 0;
+    ImGui::InputInt("Index", &idx);
+    idx = std::clamp(idx, 0, std::max(0, (int)g_sim->particles().size() - 1));
+    if (!g_sim->particles().empty()) {
+      const Particle &p = g_sim->particles()[idx];
+      ImGui::Text("fluid  : %d (%s)", (int)p.fluid,
+                  p.fluid < g_sim->numFluids()
+                      ? g_sim->fluidParams(p.fluid).name.c_str()
+                      : "STALE");
+      ImGui::Text("pos    : (%.3f, %.3f)", p.pos.x(), p.pos.y());
+      ImGui::Text("vel    : (%.3f, %.3f)", p.vel.x(), p.vel.y());
+      ImGui::Text("J      : %.4f", p.J);
+      ImGui::Text("mass   : %.4e", p.mass);
+      ImGui::Text("vol0   : %.4e", p.vol0);
+      if (p.fluid < g_sim->numFluids()) {
+        const FluidParams &fp = g_sim->fluidParams(p.fluid);
+        float J = std::clamp(p.J, kJ_min, kJ_max);
+        float pr = fp.bulk_modulus * (std::exp(-fp.gamma * std::log(J)) - 1.f);
+        pr = std::clamp(pr, -kPressureCap, kPressureCap);
+        ImGui::Text("pressure (Tait): %.2f Pa", pr);
+      }
+    }
+  }
+
+  ImGui::End();
+
+  if (g_running) {
+    for (int i = 0; i < g_spf; ++i)
+      g_sim->step();
+    updateCloud(*g_sim);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  main
+// ─────────────────────────────────────────────────────────────────────────────
+int main() {
+  SimParams sp;
+  sp.domain_w = 10.f;
+  sp.domain_h = 6.f;
+  sp.ppc = 4;
+  sp.grid_nx = 80;
+  sp.grid_ny = 48;
+  sp.gravity = -9.8f;
+  sp.computeDerived();
+
+  FluidSimulation sim(sp);
+  applyRTPreset(sim);
+
+  // dt must be re-derived after fluids are registered
+  //   sim.paramsMutable().dt = sim.params().estimateDt(sim.allFluids());
+
+  // Initialize: heavy fluid on TOP (invert_bands = true) → RT unstable.
+  BlockSpec block = makeRTBlock(sim.params());
+  sim.initialize(block);
+  g_sim = &sim;
+
+  initPendingBlock(sim.params());
+
+  polyscope::init();
+  registerDomainBox(sim.params());
+  polyscope::options::programName = "Two-Fluid Density Separation MPM (v2)";
+  polyscope::view::upDir = polyscope::UpDir::YUp;
+  polyscope::view::style = polyscope::NavigateStyle::Planar;
+  polyscope::options::groundPlaneMode = polyscope::GroundPlaneMode::None;
+  polyscope::view::lookAt({5., 3., 20.}, {5., 3., 0.}, {0., 1., 0.});
+
+  rebuildCloud(sim);
+  polyscope::state::userCallback = uiCallback;
+  polyscope::show();
+  return 0;
+}
