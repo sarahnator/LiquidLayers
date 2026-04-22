@@ -2,31 +2,14 @@
 
 // =============================================================================
 //  mpm_fluid.h  (v2)
-//
-//  Changes from v1
-//  ───────────────
-//  1. J stabilisation
-//     The explicit Euler update  J *= (1 + dt·tr(C))  is replaced by the
-//     multiplicative exponential update  J *= exp(dt·tr(C)).  This is the
-//     exact solution to  dJ/dt = J·div(v)  under a frozen velocity gradient,
-//     and it is unconditionally positive — J can never go negative or zero
-//     regardless of how large dt·tr(C) is.  We still clamp J ∈ [J_min, J_max]
-//     as a secondary guard, but the blow-up that happened on impact (where
-//     dt·tr(C) reached -1.2e7) can no longer produce a negative J.
-//
-//     Additionally, kirchhoffStress() applies a symmetric pressure cap:
-//       p = clamp(p, -pCap, +pCap)
-//     The cap prevents the Tait EOS from generating arbitrarily large pressures
-//     when J is near J_min, which is what was launching particles across the
-//     domain after the J clamp fired.
-//
-//  2. RT band ordering fix
+// =============================================================================
+//  1. RT band ordering fix
 //     initialize() now accepts a BlockSpec struct that includes an
 //     invert_bands flag.  When true, the top and bottom fluid assignments are
 //     swapped, so the denser fluid starts on top (gravitationally unstable,
 //     producing Rayleigh-Taylor fingering).
 //
-//  3. Dynamic fluid registry
+//  2. Dynamic fluid registry
 //     FluidID is a uint8_t index into a runtime std::vector<FluidParams>.
 //     The simulator supports up to kMaxFluids = 8 simultaneous types.
 //     addFluid() / removeFluid() let the UI register and deregister fluids.
@@ -184,11 +167,11 @@ struct BlockSpec {
   float layer_gap = 0.02f;
   FluidID bottom_fluid = 0; // fluid in the lower half
   FluidID top_fluid = 1;    // fluid in the upper half
-  // When true: the bottom_fluid is placed on TOP and top_fluid on BOTTOM.
-  // Use this to create a Rayleigh-Taylor unstable configuration where the
-  // denser fluid starts above the lighter one.
-  bool invert_bands = false;
 };
+
+// ── MouseForceMode
+// ────────────────────────────────────────────────────────────
+enum class MouseForceMode { GRAB, WHIRL_LEGACY, WHIRL_POOL };
 
 // ── FluidSimulation
 // ────────────────────────────────────────────────────────
@@ -220,6 +203,16 @@ public:
   // Clear all particles and seed from block.
   void initialize(const BlockSpec &block);
 
+  // ── Mouse forces ─────────────────────────────────────────────────────────
+  // Call between steps to inject a user-specified force.
+  // pos: cursor position in domain coords
+  // radius: influence radius in metres
+  // strength: force magnitude [m/s²] – additive to node velocity
+  // mode: GRAB (radial) or WHIRL (tangential)
+  void setMouseForce(Eigen::Vector2f pos, float radius, float strength,
+                     MouseForceMode mode, bool active);
+  void clearMouseForce() { mouse_active_ = false; }
+
   // Add particles from block without clearing existing ones.
   void addBlock(const BlockSpec &block);
 
@@ -238,6 +231,7 @@ private:
   void volumeRecompute();
   void P2G_stress();
   void gridUpdate();
+  void applyMouseForcesToGrid(float sub_dt);
   void G2P_advect();
 
   Eigen::Matrix2f kirchhoffStress(const Particle &p) const;
@@ -253,4 +247,11 @@ private:
   std::vector<Particle> particles_;
   std::vector<GridNode> grid_;
   int frame_ = 0;
+
+  // Mouse force state
+  bool mouse_active_ = false;
+  Eigen::Vector2f mouse_pos_ = Eigen::Vector2f::Zero();
+  float mouse_radius_ = 0.8f;
+  float mouse_strength_ = 5.f;
+  MouseForceMode mouse_mode_ = MouseForceMode::GRAB;
 };

@@ -72,9 +72,9 @@ FetchContent_MakeAvailable(eigen)
 #   $<$<CONFIG:Debug>:-O0 -g>)
 
 
-    add_executable(fluids src/main_mpm_fluid.cpp src/mpm_fluid.cpp)
-target_include_directories(fluids PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(fluids PRIVATE polyscope Eigen3::Eigen)
-target_compile_options(fluids PRIVATE
+    add_executable(mpm_fluid src/main_mpm_fluid.cpp src/mpm_fluid.cpp)
+target_include_directories(mpm_fluid PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(mpm_fluid PRIVATE polyscope Eigen3::Eigen)
+target_compile_options(mpm_fluid PRIVATE
   $<$<CONFIG:Release>:-O3 -march=native>
   $<$<CONFIG:Debug>:-O0 -g>)

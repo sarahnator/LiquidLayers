@@ -17,11 +17,20 @@
 #include "polyscope/polyscope.h"
 #include <algorithm>
 #include <string>
+#include <tuple>
+#include <vector>
 
 static FluidSimulation *g_sim = nullptr;
 static bool g_running = false;
 static int g_spf = 5;
 static const char *kCloud = "particles";
+
+// Mouse force state
+static bool g_mouse_active = true;
+static float g_mouse_radius = 0.9f;
+static float g_mouse_strength = 12.f;
+static int g_mouse_mode_idx = 0; // 0=legacy grab, 1=whirlpool
+static Eigen::Vector2f g_mouse_domain_pos = Eigen::Vector2f::Zero();
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Preset builders
@@ -29,7 +38,6 @@ static const char *kCloud = "particles";
 
 // Returns a BlockSpec configured for a Rayleigh-Taylor unstable drop.
 // Fluid 0 = light (blue),  Fluid 1 = heavy (gray).
-// invert_bands = true  →  heavy fluid starts on TOP (unstable).
 static BlockSpec makeRTBlock(const SimParams &p) {
   BlockSpec b;
   b.x_min = p.domain_w * 0.5f - 2.25f;
@@ -37,9 +45,8 @@ static BlockSpec makeRTBlock(const SimParams &p) {
   b.y_min = p.domain_h * 0.5f - 1.6f;
   b.y_max = p.domain_h * 0.5f + 1.6f;
   b.layer_gap = 0.02f;
-  b.bottom_fluid = 1;    // heavy → but will be inverted to the top
-  b.top_fluid = 0;       // light → but will be inverted to the bottom
-  b.invert_bands = true; // heavy goes on TOP: RT unstable configuration
+  b.bottom_fluid = 0; // heavy → but will be inverted to the top
+  b.top_fluid = 1;    // light → but will be inverted to the bottom
   return b;
 }
 
@@ -52,7 +59,6 @@ static BlockSpec makeStableBlock(const SimParams &p) {
   b.layer_gap = 0.02f;
   b.bottom_fluid = 1; // heavy on bottom: stable
   b.top_fluid = 0;    // light on top
-  b.invert_bands = false;
   return b;
 }
 
@@ -62,21 +68,21 @@ static void applyRTPreset(FluidSimulation &sim) {
     sim.removeFluid(0);
 
   FluidParams light;
-  light.name = "Light (blue)";
+  light.name = "Light";
   light.density0 = 700.f;
   light.bulk_modulus = 120.f;
   light.gamma = 4.f;
   light.viscosity = 0.006f;
-  light.color = {0.20f, 0.55f, 0.95f};
+  light.color = {0.05f, 0.95f, 1.00f};
   sim.addFluid(light); // FluidID 0
 
   FluidParams heavy;
-  heavy.name = "Heavy (gray)";
+  heavy.name = "Heavy";
   heavy.density0 = 2200.f;
   heavy.bulk_modulus = 260.f;
   heavy.gamma = 4.f;
   heavy.viscosity = 0.030f;
-  heavy.color = {0.42f, 0.42f, 0.46f};
+  heavy.color = {65.f / 255.f, 63.f / 255.f, 65.f / 255.f};
   sim.addFluid(heavy); // FluidID 1
 
   // Set dt from CFL using the new fluid speeds.
@@ -89,21 +95,21 @@ static void applyStablePreset(FluidSimulation &sim) {
     sim.removeFluid(0);
 
   FluidParams light;
-  light.name = "Light (blue)";
+  light.name = "Light (neon cyan)";
   light.density0 = 1000.f;
   light.bulk_modulus = 140.f;
   light.gamma = 4.f;
   light.viscosity = 0.010f;
-  light.color = {0.12f, 0.50f, 0.95f};
+  light.color = {0.05f, 0.95f, 1.00f};
   sim.addFluid(light);
 
   FluidParams heavy;
-  heavy.name = "Heavy (gray)";
+  heavy.name = "Heavy (neon lime)";
   heavy.density0 = 2200.f;
   heavy.bulk_modulus = 260.f;
   heavy.gamma = 4.f;
   heavy.viscosity = 0.030f;
-  heavy.color = {0.42f, 0.42f, 0.46f};
+  heavy.color = {65.f / 255.f, 63.f / 255.f, 65.f / 255.f};
   sim.addFluid(heavy);
 
   SimParams &sp = sim.paramsMutable();
@@ -121,7 +127,7 @@ static void registerDomainBox(const SimParams &sp) {
   edges << 0, 1, 1, 2, 2, 3, 3, 0;
   auto *box = polyscope::registerCurveNetwork("domain", nodes, edges);
   box->setRadius(0.002);
-  box->setColor({0, 0, 0});
+  box->setColor({1, 1, 1});
 }
 
 static void rebuildCloud(const FluidSimulation &sim) {
@@ -173,6 +179,74 @@ static void initPendingBlock(const SimParams &sp) {
   g_pending_inited = true;
 }
 
+static void prepareUnicodeImGuiFonts() {
+  polyscope::options::prepareImGuiFontsCallback = []() {
+    auto *atlas = new ImFontAtlas();
+
+    static const ImWchar ranges[] = {
+        0x0020, 0x00FF, // Basic Latin + Latin-1
+        0x0370, 0x03FF, // Greek/Coptic
+        0x2070, 0x209F, // Superscripts/Subscripts
+        0};
+
+    ImFontConfig cfg;
+    auto addFirstAvailableFont = [&](const std::vector<const char *> &paths,
+                                     float size) -> ImFont * {
+      for (const char *path : paths) {
+        if (ImFont *f = atlas->AddFontFromFileTTF(path, size, &cfg, ranges))
+          return f;
+      }
+      return nullptr;
+    };
+
+    ImFont *regular =
+        addFirstAvailableFont({"/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+                               "/System/Library/Fonts/Supplemental/Times New Roman.ttf",
+                               "/System/Library/Fonts/Supplemental/Arial.ttf"},
+                              16.0f);
+
+    ImFont *mono =
+        addFirstAvailableFont({"/System/Library/Fonts/Supplemental/Courier New.ttf",
+                               "/System/Library/Fonts/Supplemental/Menlo.ttc"},
+                              14.0f);
+
+    if (!regular)
+      regular = atlas->AddFontDefault();
+    if (!mono)
+      mono = regular;
+
+    return std::make_tuple(atlas, regular, mono);
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Mouse → domain coordinates
+//
+//  Polyscope's planar camera looks down -Z at the XY plane.
+//  We unproject screen-space mouse from ImGui into world coords.
+// ─────────────────────────────────────────────────────────────────────────────
+static Eigen::Vector2f mouseToDomain() {
+  ImVec2 mp = ImGui::GetMousePos();
+  ImVec2 display_size = ImGui::GetIO().DisplaySize;
+  float sx = mp.x / display_size.x;
+  float sy = 1.f - mp.y / display_size.y;
+
+  // Unproject via polyscope camera
+  glm::vec4 viewport = {0.f, 0.f, (float)display_size.x, (float)display_size.y};
+  glm::mat4 view = polyscope::view::getCameraViewMatrix();
+  glm::mat4 proj = polyscope::view::getCameraPerspectiveMatrix();
+
+  float px = mp.x, py = display_size.y - mp.y;
+  glm::vec3 win_near(px, py, 0.f);
+  glm::vec3 win_far(px, py, 1.f);
+  glm::vec3 wn = glm::unProject(win_near, view, proj, viewport);
+  glm::vec3 wf = glm::unProject(win_far, view, proj, viewport);
+
+  // Intersect ray with z=0 plane
+  float t = -wn.z / (wf.z - wn.z + 1e-12f);
+  return Eigen::Vector2f(wn.x + t * (wf.x - wn.x), wn.y + t * (wf.y - wn.y));
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  showFluidEditor() — inline material panel for one fluid slot
 // ─────────────────────────────────────────────────────────────────────────────
@@ -214,6 +288,30 @@ void uiCallback() {
   ImGui::SetNextWindowSize({450.f, 900.f}, ImGuiCond_FirstUseEver);
   ImGui::Begin("Two-Fluid MPM");
 
+  // ── Mouse force update ────────────────────────────────────────────────────
+  bool hover_imgui = ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) ||
+                     ImGui::IsAnyItemActive();
+  if (g_mouse_active && !hover_imgui) {
+    g_mouse_domain_pos = mouseToDomain();
+    MouseForceMode mode = MouseForceMode::GRAB;
+    switch (g_mouse_mode_idx) {
+    case 0:
+      mode = MouseForceMode::GRAB;
+      break;
+    case 1:
+      mode = MouseForceMode::WHIRL_POOL;
+      break;
+    default:
+      mode = MouseForceMode::GRAB;
+      break;
+    }
+    bool lmb_down = ImGui::IsMouseDown(0);
+    g_sim->setMouseForce(g_mouse_domain_pos, g_mouse_radius, g_mouse_strength,
+                         mode, lmb_down);
+  } else {
+    g_sim->clearMouseForce();
+  }
+
   // ── Status ────────────────────────────────────────────────────────────────
   ImGui::Text("Particles : %zu", g_sim->particles().size());
   ImGui::Text("Frame     : %d", g_sim->frame());
@@ -238,22 +336,6 @@ void uiCallback() {
   ImGui::SliderInt("Steps/frame", &g_spf, 1, 30);
   ImGui::Separator();
 
-  // ── Presets ───────────────────────────────────────────────────────────────
-  ImGui::TextDisabled("── Presets ──");
-  if (ImGui::Button("Rayleigh-Taylor (unstable, heavy on top)")) {
-    g_running = false;
-    applyRTPreset(*g_sim);
-    g_sim->initialize(makeRTBlock(g_sim->params()));
-    rebuildCloud(*g_sim);
-    initPendingBlock(g_sim->params());
-  }
-  if (ImGui::Button("Stable drop (heavy on bottom)")) {
-    g_running = false;
-    applyStablePreset(*g_sim);
-    g_sim->initialize(makeStableBlock(g_sim->params()));
-    rebuildCloud(*g_sim);
-    initPendingBlock(g_sim->params());
-  }
   if (ImGui::Button("Reset (same fluids, same block)")) {
     g_running = false;
     g_sim->initialize(g_pending_block);
@@ -272,6 +354,35 @@ void uiCallback() {
     ImGui::Text("CFL dt: %.2e s", cfl);
     // ImGui::SameLine();
     // if (ImGui::Button("Use CFL dt")) sp.dt = cfl;
+  }
+
+  // ── Mouse forces ──────────────────────────────────────────────────────────
+  if (ImGui::CollapsingHeader("Mouse Forces", ImGuiTreeNodeFlags_DefaultOpen)) {
+    ImGui::Checkbox("Enable mouse interaction", &g_mouse_active);
+
+    if (g_mouse_active) {
+      const char *modes[] = {"Grab (radial pull)",
+                             "Whirlpool (spin + inward pull)"};
+      ImGui::Combo("Mode", &g_mouse_mode_idx, modes, 2);
+
+      if (g_mouse_mode_idx == 0) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.7f, 0.3f, 1.f));
+        ImGui::TextWrapped(
+            "Hold LMB to apply a radial pull toward the cursor.");
+        ImGui::PopStyleColor();
+      } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.45f, 0.85f, 1.0f, 1.f));
+        ImGui::TextWrapped("Apply a vortex target field with "
+                           "tangential spin plus inward "
+                           "radial pull for a more whirlpool-like motion.");
+        ImGui::PopStyleColor();
+      }
+
+      ImGui::SliderFloat("Radius [m]", &g_mouse_radius, 0.2f, 3.f);
+      ImGui::SliderFloat("Strength", &g_mouse_strength, 1.f, 50.f);
+      ImGui::Text("Cursor: (%.2f, %.2f)", g_mouse_domain_pos.x(),
+                  g_mouse_domain_pos.y());
+    }
   }
 
   // ── Fluid registry ────────────────────────────────────────────────────────
@@ -293,34 +404,59 @@ void uiCallback() {
       if (ImGui::Button("+ Add new fluid")) {
         FluidParams nf;
         nf.name = "New fluid " + std::to_string(g_sim->numFluids());
-        // Give it a random-ish colour so it's visually distinct
-        float hue = (float)g_sim->numFluids() * 0.618034f; // golden ratio
-        hue -= std::floor(hue);
-        // Simple HSV→RGB for h in [0,1), s=0.7, v=0.9
-        float h6 = hue * 6.f;
-        int hi = (int)h6;
-        float f = h6 - hi, p = 0.9f * 0.3f, q = 0.9f * (1 - (0.7f * f)),
-              t = 0.9f * (1 - 0.7f * (1 - f));
-        switch (hi % 6) {
-        case 0:
-          nf.color = {0.9f, t, p};
-          break;
-        case 1:
-          nf.color = {q, 0.9f, p};
-          break;
-        case 2:
-          nf.color = {p, 0.9f, t};
-          break;
-        case 3:
-          nf.color = {p, q, 0.9f};
-          break;
-        case 4:
-          nf.color = {t, p, 0.9f};
-          break;
-        default:
-          nf.color = {0.9f, p, q};
-          break;
+
+        auto neonFromHue = [](float hue) -> std::array<float, 3> {
+          hue -= std::floor(hue);
+          float h6 = hue * 6.f;
+          int hi = (int)h6;
+          float f = h6 - hi;
+          float p = 0.10f;          // v=1, s=0.9
+          float q = 1.f - 0.9f * f; // v*(1-s*f)
+          float t = 1.f - 0.9f * (1 - f);
+          switch (hi % 6) {
+          case 0:
+            return {1.f, t, p};
+          case 1:
+            return {q, 1.f, p};
+          case 2:
+            return {p, 1.f, t};
+          case 3:
+            return {p, q, 1.f};
+          case 4:
+            return {t, p, 1.f};
+          default:
+            return {1.f, p, q};
+          }
+        };
+
+        auto colorDist2 = [](const std::array<float, 3> &a,
+                             const std::array<float, 3> &b) {
+          const float dr = a[0] - b[0];
+          const float dg = a[1] - b[1];
+          const float db = a[2] - b[2];
+          return dr * dr + dg * dg + db * db;
+        };
+
+        // Pick the hue whose neon RGB is farthest from existing fluid colors.
+        const int hue_samples = 96;
+        float best_score = -1.f;
+        std::array<float, 3> best_color = {1.f, 0.1f, 0.1f};
+        for (int s = 0; s < hue_samples; ++s) {
+          const float hue = (float)s / (float)hue_samples;
+          const auto cand = neonFromHue(hue);
+
+          float min_d2 = 1e9f;
+          for (int fid = 0; fid < g_sim->numFluids(); ++fid) {
+            const auto &c = g_sim->fluidParams((FluidID)fid).color;
+            min_d2 = std::min(min_d2, colorDist2(cand, c));
+          }
+
+          if (min_d2 > best_score) {
+            best_score = min_d2;
+            best_color = cand;
+          }
         }
+        nf.color = best_color;
         int new_id = g_sim->addFluid(nf);
         if (new_id >= 0)
           std::cout << "[UI] Added fluid " << new_id << "\n";
@@ -383,16 +519,10 @@ void uiCallback() {
     fnames.push_back(nullptr); // sentinel
 
     int bot = (int)b.bottom_fluid, top = (int)b.top_fluid;
-    ImGui::Combo("Bottom fluid", &bot, fnames.data(), nf);
     ImGui::Combo("Top fluid", &top, fnames.data(), nf);
-    b.bottom_fluid = (FluidID)std::clamp(bot, 0, nf - 1);
+    ImGui::Combo("Bottom fluid", &bot, fnames.data(), nf);
     b.top_fluid = (FluidID)std::clamp(top, 0, nf - 1);
-
-    ImGui::Checkbox("Invert bands (put 'bottom' fluid on top)",
-                    &b.invert_bands);
-    ImGui::TextWrapped(
-        "Tip: to get RT instability, assign the denser fluid as 'bottom fluid' "
-        "and check 'Invert bands' so it starts physically on top.");
+    b.bottom_fluid = (FluidID)std::clamp(bot, 0, nf - 1);
 
     // Clamp geometry to domain
     const SimParams &sp = g_sim->params();
@@ -452,12 +582,18 @@ void uiCallback() {
 //  main
 // ─────────────────────────────────────────────────────────────────────────────
 int main() {
+  prepareUnicodeImGuiFonts();
+  polyscope::init();
+  auto [win_w, win_h] = polyscope::view::getWindowSize();
+  const float window_aspect =
+      (win_h > 0) ? (float)win_w / (float)win_h : (16.f / 9.f);
+
   SimParams sp;
-  sp.domain_w = 10.f;
   sp.domain_h = 6.f;
+  sp.domain_w = sp.domain_h * window_aspect;
   sp.ppc = 4;
-  sp.grid_nx = 80;
   sp.grid_ny = 48;
+  sp.grid_nx = std::max(16, (int)(sp.grid_ny * window_aspect + 0.5f));
   sp.gravity = -9.8f;
   sp.computeDerived();
 
@@ -467,20 +603,26 @@ int main() {
   // dt must be re-derived after fluids are registered
   //   sim.paramsMutable().dt = sim.params().estimateDt(sim.allFluids());
 
-  // Initialize: heavy fluid on TOP (invert_bands = true) → RT unstable.
+  // Initialize: heavy fluid on TOP → RT unstable.
   BlockSpec block = makeRTBlock(sim.params());
   sim.initialize(block);
   g_sim = &sim;
 
   initPendingBlock(sim.params());
 
-  polyscope::init();
   registerDomainBox(sim.params());
-  polyscope::options::programName = "Two-Fluid Density Separation MPM (v2)";
+  polyscope::options::programName = "MPM Fluid Demo";
   polyscope::view::upDir = polyscope::UpDir::YUp;
   polyscope::view::style = polyscope::NavigateStyle::Planar;
   polyscope::options::groundPlaneMode = polyscope::GroundPlaneMode::None;
-  polyscope::view::lookAt({5., 3., 20.}, {5., 3., 0.}, {0., 1., 0.});
+  polyscope::options::buildDefaultGuiPanels = false;
+  polyscope::options::openImGuiWindowForUserCallback = false;
+  polyscope::view::bgColor = {0.f, 0.f, 0.f, 1.f};
+  const double cx = 0.5 * sim.params().domain_w;
+  const double cy = 0.5 * sim.params().domain_h;
+  const double cz = 2.0 * std::max((double)sim.params().domain_w,
+                                   (double)sim.params().domain_h);
+  polyscope::view::lookAt({cx, cy, cz}, {cx, cy, 0.0}, {0., 1., 0.});
 
   rebuildCloud(sim);
   polyscope::state::userCallback = uiCallback;

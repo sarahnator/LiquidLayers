@@ -105,10 +105,7 @@ void FluidSimulation::seedBand(float x0, float x1, float y0, float y1,
 //    top    band: [y_mid + gap/2,  y_max]   → top_fluid
 //    bottom band: [y_min,          y_mid - gap/2] → bottom_fluid
 //
-//  When block.invert_bands = true, the fluid assignments are swapped so the
-//  "bottom_fluid" is seeded on top.  This is the correct way to configure a
-//  Rayleigh-Taylor scenario: assign the heavy fluid as bottom_fluid but also
-//  set invert_bands=true so it physically starts on top.
+//  To configure a Rayleigh-Taylor scenario: assign the heavy fluid as top_fluid
 // ─────────────────────────────────────────────────────────────────────────────
 void FluidSimulation::addBlock(const BlockSpec &block) {
   float H = block.y_max - block.y_min;
@@ -116,9 +113,8 @@ void FluidSimulation::addBlock(const BlockSpec &block) {
   float layer_h = std::max(0.5f * (H - gap), 0.f);
 
   // Natural assignment: bottom band → bottom_fluid, top band → top_fluid.
-  // invert_bands swaps which fluid goes where without changing the geometry.
-  FluidID lo_fluid = block.invert_bands ? block.top_fluid : block.bottom_fluid;
-  FluidID hi_fluid = block.invert_bands ? block.bottom_fluid : block.top_fluid;
+  FluidID lo_fluid = block.bottom_fluid;
+  FluidID hi_fluid = block.top_fluid;
 
   float lo_y0 = block.y_min;
   float lo_y1 = block.y_min + layer_h;
@@ -218,6 +214,131 @@ Eigen::Matrix2f FluidSimulation::kirchhoffStress(const Particle &p) const {
   }
 
   return tau;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Mouse force injection
+// ─────────────────────────────────────────────────────────────────────────────
+void FluidSimulation::setMouseForce(Eigen::Vector2f pos, float radius,
+                                    float strength, MouseForceMode mode,
+                                    bool active) {
+  mouse_pos_ = pos;
+  mouse_radius_ = radius;
+  mouse_strength_ = strength;
+  mouse_mode_ = mode;
+  mouse_active_ = active;
+}
+
+void FluidSimulation::applyMouseForcesToGrid(float sub_dt) {
+  if (!mouse_active_)
+    return;
+
+  const float dx = params_.dx;
+  const int nx = params_.grid_nx, ny = params_.grid_ny;
+
+  // Legacy grab mode (radial pull).
+  if (mouse_mode_ == MouseForceMode::GRAB) {
+    for (int j = 0; j < ny; ++j) {
+      for (int i = 0; i < nx; ++i) {
+        auto &node = grid_[gridIdx(i, j)];
+        if (node.mass < 1e-12f)
+          continue;
+
+        Eigen::Vector2f xn((float)i * dx, (float)j * dx);
+        Eigen::Vector2f r = xn - mouse_pos_;
+        float dist = r.norm();
+        if (dist > mouse_radius_)
+          continue;
+
+        // Smooth compact falloff:
+        //   w = (1 - (d/R)^2)^2
+        float t = dist / mouse_radius_;
+        float w = (1.f - t * t) * (1.f - t * t);
+
+        Eigen::Vector2f dir =
+            (dist > 1e-6f) ? (-r / dist).eval() : Eigen::Vector2f::Zero();
+        Eigen::Vector2f dv = w * mouse_strength_ * sub_dt * dir;
+        node.vel_new += dv;
+      }
+    }
+    return;
+  }
+
+  // WHIRL_LEGACY has been intentionally disabled.
+  //
+  // if (mouse_mode_ == MouseForceMode::WHIRL_LEGACY) {
+  //   for (int j = 0; j < ny; ++j) {
+  //     for (int i = 0; i < nx; ++i) {
+  //       auto &node = grid_[gridIdx(i, j)];
+  //       if (node.mass < 1e-12f)
+  //         continue;
+  //
+  //       Eigen::Vector2f xn((float)i * dx, (float)j * dx);
+  //       Eigen::Vector2f r = xn - mouse_pos_;
+  //       float dist = r.norm();
+  //       if (dist > mouse_radius_)
+  //         continue;
+  //
+  //       float t = dist / mouse_radius_;
+  //       float w = (1.f - t * t) * (1.f - t * t);
+  //       Eigen::Vector2f tangent(-r.y(), r.x());
+  //       if (dist > 1e-6f)
+  //         tangent /= dist;
+  //
+  //       node.vel_new += w * mouse_strength_ * sub_dt * tangent;
+  //     }
+  //   }
+  //   return;
+  // }
+
+  // -------------------------------------------------------------------------
+  // WHIRL_POOL: tangential spin + inward radial pull
+  //
+  // v_target = v_theta * e_t + v_rad * e_r
+  //
+  // e_t: tangential unit vector
+  // e_r: inward radial unit vector
+  //
+  // This is more whirlpool-like than pure tangential spin because it both
+  // rotates material and draws it toward the vortex core.
+  // -------------------------------------------------------------------------
+  if (mouse_mode_ == MouseForceMode::WHIRL_POOL) {
+    const float R = mouse_radius_;
+    const float omega = mouse_strength_;
+    const float inward = 0.6f * omega;
+    const float gain = 8.0f;
+
+    for (int j = 0; j < ny; ++j) {
+      for (int i = 0; i < nx; ++i) {
+        auto &node = grid_[gridIdx(i, j)];
+        if (node.mass < 1e-12f)
+          continue;
+
+        Eigen::Vector2f xn((float)i * dx, (float)j * dx);
+        Eigen::Vector2f r = xn - mouse_pos_;
+        float dist = r.norm();
+
+        if (dist >= R || dist < 1e-6f)
+          continue;
+
+        float q = 1.f - dist / R;
+        float s = q * q;
+
+        Eigen::Vector2f e_t(-r.y(), r.x());
+        e_t /= dist;
+
+        Eigen::Vector2f e_r = -r / dist;
+
+        float v_theta = omega * dist;
+        float v_rad = inward * q;
+
+        Eigen::Vector2f v_target = v_theta * e_t + v_rad * e_r;
+
+        node.vel_new += gain * s * (v_target - node.vel_new) * sub_dt;
+      }
+    }
+    return;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -334,7 +455,7 @@ void FluidSimulation::P2G_stress() {
 //
 //  Wall thickness wall=2 gives 2·dx of buffer.  The quadratic B-spline
 //  support is 1.5·dx wide, so wall=2 ensures no stencil node lies outside
-//  the domain.  Increase to 3 if you see artefacts near boundaries.
+//  the domain.
 // ─────────────────────────────────────────────────────────────────────────────
 void FluidSimulation::gridUpdate() {
   const float dt = params_.dt;
@@ -446,6 +567,13 @@ void FluidSimulation::step() {
   volumeRecompute();
   P2G_stress();
   gridUpdate();
+
+  // Apply user interaction after mass/momentum/stress have been transferred
+  // to the grid and before G2P so the modified grid state is what particles
+  // gather back.
+  applyMouseForcesToGrid(params_.dt);
+
   G2P_advect();
+
   ++frame_;
 }
