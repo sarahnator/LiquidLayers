@@ -1,13 +1,17 @@
 // =============================================================================
-//  main_mpm_fluid.cpp  (v2)
+//  main_mpm_fluid.cpp
 //
-//  UI changes from v1:
-//    • "Add fluid" button registers a new FluidParams in the runtime registry.
-//    • "Remove fluid" button (with particle-count safety warning).
-//    • "Drop block" panel lets the user choose which two fluids fill the next
-//      block, set the block geometry, and toggle invert_bands.
-//    • RT preset now correctly passes invert_bands=true so the heavy fluid
-//      (registered as bottom_fluid) physically starts on TOP.
+//  Polyscope / ImGui front end for the 2D MPM liquid demo.
+//
+//  Main UI features in the current code:
+//    • runtime fluid registry editing
+//    • block seeding with explicit top_fluid / bottom_fluid assignment
+//    • mouse-driven grab / whirlpool interaction
+//    • simple playback controls and particle inspection
+//
+//  Important note:
+//    If you want a Rayleigh-Taylor-unstable drop,
+//    assign the denser material to top_fluid directly.
 // =============================================================================
 
 #include "imgui.h"
@@ -25,7 +29,7 @@ static bool g_running = false;
 static int g_spf = 5;
 static const char *kCloud = "particles";
 
-// Mouse force state
+// Mouse-force UI state
 static bool g_mouse_active = true;
 static float g_mouse_radius = 0.9f;
 static float g_mouse_strength = 12.f;
@@ -36,8 +40,9 @@ static Eigen::Vector2f g_mouse_domain_pos = Eigen::Vector2f::Zero();
 //  Preset builders
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Returns a BlockSpec configured for a Rayleigh-Taylor unstable drop.
-// Fluid 0 = light (blue),  Fluid 1 = heavy (gray).
+// Returns a BlockSpec configured for a two-layer block.
+// In the RT preset below, Fluid 0 is light and Fluid 1 is heavy, so assigning
+// bottom_fluid=0 and top_fluid=1 makes the heavy phase start on top.
 static BlockSpec makeRTBlock(const SimParams &p) {
   BlockSpec b;
   b.x_min = p.domain_w * 0.5f - 2.25f;
@@ -45,8 +50,8 @@ static BlockSpec makeRTBlock(const SimParams &p) {
   b.y_min = p.domain_h * 0.5f - 1.6f;
   b.y_max = p.domain_h * 0.5f + 1.6f;
   b.layer_gap = 0.02f;
-  b.bottom_fluid = 0; // heavy → but will be inverted to the top
-  b.top_fluid = 1;    // light → but will be inverted to the bottom
+  b.bottom_fluid = 0; // light phase in the lower band of the block
+  b.top_fluid = 1;    // heavy phase in the upper band of the block
   return b;
 }
 
@@ -63,7 +68,7 @@ static BlockSpec makeStableBlock(const SimParams &p) {
 }
 
 static void applyRTPreset(FluidSimulation &sim) {
-  // Register exactly two fluids; clear any previous registry.
+  // Rebuild the registry with a light and heavy phase.
   while (sim.numFluids() > 0)
     sim.removeFluid(0);
 
@@ -95,7 +100,7 @@ static void applyStablePreset(FluidSimulation &sim) {
     sim.removeFluid(0);
 
   FluidParams light;
-  light.name = "Light (neon cyan)";
+  light.name = "Light";
   light.density0 = 1000.f;
   light.bulk_modulus = 140.f;
   light.gamma = 4.f;
@@ -104,7 +109,7 @@ static void applyStablePreset(FluidSimulation &sim) {
   sim.addFluid(light);
 
   FluidParams heavy;
-  heavy.name = "Heavy (neon lime)";
+  heavy.name = "Heavy";
   heavy.density0 = 2200.f;
   heavy.bulk_modulus = 260.f;
   heavy.gamma = 4.f;
@@ -135,7 +140,8 @@ static void rebuildCloud(const FluidSimulation &sim) {
   std::vector<std::array<double, 3>> pts(ps.size()), cols(ps.size());
   for (size_t i = 0; i < ps.size(); ++i) {
     pts[i] = {(double)ps[i].pos.x(), (double)ps[i].pos.y(), 0.0};
-    // Guard against stale FluidID after a removeFluid call
+    // Colors are looked up through the current registry. A magenta fallback is
+    // shown if a particle ever carries an out-of-range FluidID.
     if (ps[i].fluid < sim.numFluids()) {
       const auto &c = sim.fluidParams(ps[i].fluid).color;
       cols[i] = {(double)c[0], (double)c[1], (double)c[2]};
@@ -170,6 +176,9 @@ static void updateCloud(const FluidSimulation &sim) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  UI state for the "drop block" panel
+//
+//  g_pending_block stores the next block the user intends to seed. The block is
+//  only applied when the user presses one of the drop / replace buttons.
 // ─────────────────────────────────────────────────────────────────────────────
 static BlockSpec g_pending_block;
 static bool g_pending_inited = false;
@@ -183,11 +192,10 @@ static void prepareUnicodeImGuiFonts() {
   polyscope::options::prepareImGuiFontsCallback = []() {
     auto *atlas = new ImFontAtlas();
 
-    static const ImWchar ranges[] = {
-        0x0020, 0x00FF, // Basic Latin + Latin-1
-        0x0370, 0x03FF, // Greek/Coptic
-        0x2070, 0x209F, // Superscripts/Subscripts
-        0};
+    static const ImWchar ranges[] = {0x0020, 0x00FF, // Basic Latin + Latin-1
+                                     0x0370, 0x03FF, // Greek/Coptic
+                                     0x2070, 0x209F, // Superscripts/Subscripts
+                                     0};
 
     ImFontConfig cfg;
     auto addFirstAvailableFont = [&](const std::vector<const char *> &paths,
@@ -199,16 +207,16 @@ static void prepareUnicodeImGuiFonts() {
       return nullptr;
     };
 
-    ImFont *regular =
-        addFirstAvailableFont({"/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-                               "/System/Library/Fonts/Supplemental/Times New Roman.ttf",
-                               "/System/Library/Fonts/Supplemental/Arial.ttf"},
-                              16.0f);
+    ImFont *regular = addFirstAvailableFont(
+        {"/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+         "/System/Library/Fonts/Supplemental/Times New Roman.ttf",
+         "/System/Library/Fonts/Supplemental/Arial.ttf"},
+        16.0f);
 
-    ImFont *mono =
-        addFirstAvailableFont({"/System/Library/Fonts/Supplemental/Courier New.ttf",
-                               "/System/Library/Fonts/Supplemental/Menlo.ttc"},
-                              14.0f);
+    ImFont *mono = addFirstAvailableFont(
+        {"/System/Library/Fonts/Supplemental/Courier New.ttf",
+         "/System/Library/Fonts/Supplemental/Menlo.ttc"},
+        14.0f);
 
     if (!regular)
       regular = atlas->AddFontDefault();
@@ -288,7 +296,9 @@ void uiCallback() {
   ImGui::SetNextWindowSize({450.f, 900.f}, ImGuiCond_FirstUseEver);
   ImGui::Begin("Two-Fluid MPM");
 
-  // ── Mouse force update ────────────────────────────────────────────────────
+  // ── Mouse-force update ───────────────────────────────────────────────────
+  // Mouse forcing is only armed while the cursor is not over the GUI, and the
+  // force is only actually applied while LMB is held down.
   bool hover_imgui = ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) ||
                      ImGui::IsAnyItemActive();
   if (g_mouse_active && !hover_imgui) {
@@ -512,7 +522,7 @@ void uiCallback() {
 
     // Combo boxes for which fluid fills each half
     int nf = g_sim->numFluids();
-    // Build name list for combo
+    // Build the list of names used by the two fluid-selection combo boxes.
     std::vector<const char *> fnames;
     for (int i = 0; i < nf; ++i)
       fnames.push_back(g_sim->fluidParams((FluidID)i).name.c_str());
@@ -600,10 +610,10 @@ int main() {
   FluidSimulation sim(sp);
   applyRTPreset(sim);
 
-  // dt must be re-derived after fluids are registered
-  //   sim.paramsMutable().dt = sim.params().estimateDt(sim.allFluids());
+  // You can optionally re-derive dt from the CFL estimate after the
+  // fluids are registered. It is left manual here for easier experimentation.
 
-  // Initialize: heavy fluid on TOP → RT unstable.
+  // Initialize with heavy fluid in the upper band, which is RT-unstable.
   BlockSpec block = makeRTBlock(sim.params());
   sim.initialize(block);
   g_sim = &sim;

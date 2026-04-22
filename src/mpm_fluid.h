@@ -1,25 +1,43 @@
 #pragma once
 
 // =============================================================================
-//  mpm_fluid.h  (v2)
+//  mpm_fluid.h
 // =============================================================================
-//  1. RT band ordering fix
-//     initialize() now accepts a BlockSpec struct that includes an
-//     invert_bands flag.  When true, the top and bottom fluid assignments are
-//     swapped, so the denser fluid starts on top (gravitationally unstable,
-//     producing Rayleigh-Taylor fingering).
+//  This file defines a small 2D weakly-compressible MPM/APIC liquid solver with
+//  a runtime fluid registry.
 //
-//  2. Dynamic fluid registry
-//     FluidID is a uint8_t index into a runtime std::vector<FluidParams>.
-//     The simulator supports up to kMaxFluids = 8 simultaneous types.
-//     addFluid() / removeFluid() let the UI register and deregister fluids.
-//     addBlock() seeds a new rectangular region of particles without
-//     clearing existing ones, so the user can drop additional blocks at will.
+//  What the current code actually supports:
+//    1. Multiple runtime-configurable fluids
+//       - FluidID is a uint8_t index into std::vector<FluidParams>.
+//       - Up to kMaxFluids fluid types can coexist.
+//       - addFluid()/removeFluid() edit that registry at runtime.
 //
-//  Constitutive model (unchanged from v1)
-//  ───────────────────────────────────────
-//      τ = -J·p·I  +  J·μ·(C + Cᵀ)
-//      p = K · (J^{-γ} - 1)        [Tait EOS]
+//    2. Rectangular two-band block seeding
+//       - initialize(block) clears all particles and seeds one block.
+//       - addBlock(block) appends another block without clearing the old ones.
+//       - A BlockSpec always creates two horizontal bands:
+//           lower half -> bottom_fluid
+//           upper half -> top_fluid
+//       - There is no longer an invert_bands flag in the live code. If you want
+//         a Rayleigh-Taylor-unstable configuration, assign the denser material
+//         to top_fluid yourself.
+//
+//    3. Mouse-driven interaction modes applied on the grid
+//       - GRAB: radial pull toward the cursor.
+//       - WHIRL_POOL: tangential spin plus inward pull, implemented as a target
+//         velocity field blended into grid velocities.
+//       - A legacy tangential-only whirl path exists in comments in the .cpp
+//         file but is intentionally disabled.
+//
+//  Constitutive model used by the current solver:
+//    τ = -J p I + J μ (C + Cᵀ)
+//    p = K (J^{-γ} - 1)          [Tait EOS]
+//
+//  where:
+//    J  = local volume ratio proxy
+//    C  = APIC affine velocity matrix / local velocity-gradient estimate
+//    μ  = viscosity
+//    K, γ = Tait EOS parameters
 // =============================================================================
 
 #include <Eigen/Dense>
@@ -28,57 +46,53 @@
 #include <string>
 #include <vector>
 
-// ── Constants
-// ─────────────────────────────────────────────────────────────────
+// ── Constants ────────────────────────────────────────────────────────────────
 static constexpr int kMaxFluids = 8;
-static constexpr float kJ_min = 0.2f;       // hard lower bound on Jacobian
-static constexpr float kJ_max = 5.0f;       // hard upper bound on Jacobian
-static constexpr float kPressureCap = 5e4f; // maximum |pressure| in stress [Pa]
+static constexpr float kJ_min = 0.2f;       // lower safety clamp on J
+static constexpr float kJ_max = 5.0f;       // upper safety clamp on J
+static constexpr float kPressureCap = 5e4f; // optional symmetric pressure cap
 
-// ── FluidParams
-// ───────────────────────────────────────────────────────────────
+// ── FluidParams ──────────────────────────────────────────────────────────────
+// Per-material parameters for the weakly-compressible liquid model.
 struct FluidParams {
   std::string name = "Fluid";
-  float density0 = 1000.f;    // rest density ρ₀    [kg/m²]
-  float bulk_modulus = 200.f; // Tait stiffness K   [Pa]
-  float gamma = 4.f;          // Tait exponent      [-]
+  float density0 = 1000.f;    // reference density ρ₀ [kg/m² in this 2D setup]
+  float bulk_modulus = 200.f; // Tait stiffness K [Pa]
+  float gamma = 4.f;          // Tait exponent γ [-]
   float viscosity = 0.01f;    // dynamic viscosity μ [Pa·s]
   std::array<float, 3> color = {0.5f, 0.5f, 0.5f};
 
-  // Wave speed c₀ = sqrt(K·γ/ρ₀) — used for CFL timestep estimate.
+  // Small-signal wave speed estimate used for a CFL-style dt suggestion.
   float c0 = 0.f;
   void computeDerived() {
     c0 = std::sqrt(bulk_modulus * gamma / std::max(density0, 1.f));
   }
 };
 
-// ── FluidID
-// ─────────────────────────────────────────────────────────────────── Index
-// into the simulator's runtime fluid registry.  uint8_t keeps the per-particle
-// memory footprint small.
+// ── FluidID ──────────────────────────────────────────────────────────────────
+// Index into the runtime fluid registry.
 using FluidID = uint8_t;
 
-// ── SimParams
-// ─────────────────────────────────────────────────────────────────
+// ── SimParams ────────────────────────────────────────────────────────────────
 struct SimParams {
   float domain_w = 10.f;
   float domain_h = 6.f;
   int grid_nx = 80;
   int grid_ny = 48;
-  int ppc = 4;     // particle seeding: ppc×ppc per grid cell
-  float dt = 2e-3; // 1e-4f;
+  int ppc = 4;     // seed ppc×ppc particles per grid cell area
+  float dt = 2e-3; // simulation timestep
   float gravity = -9.8f;
 
-  // Derived
-  float dx = 1.f;    // cell size = domain_w / grid_nx
-  float D_inv = 4.f; // APIC D⁻¹ for quadratic B-splines = 4/dx²
+  // Derived quantities updated by computeDerived().
+  float dx = 1.f;    // grid spacing = domain_w / grid_nx
+  float D_inv = 4.f; // APIC normalization for quadratic B-splines = 4/dx²
 
   void computeDerived() {
     dx = domain_w / static_cast<float>(grid_nx);
     D_inv = 4.f / (dx * dx);
   }
 
-  // CFL-safe dt.  Safety factor 0.3; raise to ~0.4 if bulk moduli are low.
+  // CFL-style dt estimate using the largest wave speed among registered fluids.
   float estimateDt(const std::vector<FluidParams> &fluids) const {
     float c_max = 0.f;
     for (const auto &f : fluids)
@@ -87,20 +101,18 @@ struct SimParams {
   }
 };
 
-// ── Particle
-// ──────────────────────────────────────────────────────────────────
+// ── Particle ─────────────────────────────────────────────────────────────────
 struct Particle {
   Eigen::Vector2f pos = Eigen::Vector2f::Zero();
   Eigen::Vector2f vel = Eigen::Vector2f::Zero();
-  Eigen::Matrix2f C = Eigen::Matrix2f::Zero(); // APIC affine matrix
-  float J = 1.f;    // volume ratio det(F); guaranteed > 0
-  float mass = 1.f; // [kg]
-  float vol0 = 1.f; // reference volume [m²], refreshed each step
+  Eigen::Matrix2f C = Eigen::Matrix2f::Zero(); // APIC affine velocity matrix
+  float J = 1.f;    // scalar compression / expansion proxy
+  float mass = 1.f; // particle mass
+  float vol0 = 1.f; // effective particle volume used in stress scatter
   FluidID fluid = 0;
 };
 
-// ── GridNode
-// ──────────────────────────────────────────────────────────────────
+// ── GridNode ─────────────────────────────────────────────────────────────────
 struct GridNode {
   float mass = 0.f;
   Eigen::Vector2f momentum = Eigen::Vector2f::Zero();
@@ -109,25 +121,18 @@ struct GridNode {
   Eigen::Vector2f force = Eigen::Vector2f::Zero();
 };
 
-// ── WeightStencil
-// ─────────────────────────────────────────────────────────────
-//  Quadratic B-spline weights and gradients for a 3×3 node stencil.
+// ── WeightStencil ────────────────────────────────────────────────────────────
+// Quadratic B-spline weights and gradients over a 3×3 node stencil.
 //
-//  Given particle position x_p and cell size dx:
-//    base = floor(x_p/dx - 0.5)  clamped to [0, n-3]
-//    ξ    = x_p/dx - base          (falls in roughly [0.5, 1.5))
+// For particle position x_p and grid spacing dx:
+//   base = floor(x_p/dx - 0.5), clamped so the 3×3 stencil stays in-bounds
+//   ξ    = x_p/dx - base
 //
-//  1-D weights:
-//    w₀ = ½(1.5 - ξ)²
-//    w₁ = ¾ - (ξ-1)²
-//    w₂ = ½(ξ - 0.5)²
-//
-//  1-D weight derivatives w.r.t. x_p (chain rule through ξ):
-//    dw₀/dx_p = -(1.5-ξ)/dx
-//    dw₁/dx_p = -2(ξ-1)/dx
-//    dw₂/dx_p =  (ξ-0.5)/dx
-//
-//  2-D: w_{ab} = wx[a]·wy[b],  ∇w_{ab} = (dwx[a]·wy[b], wx[a]·dwy[b])
+// The code stores both the weights and their spatial derivatives so the same
+// helper can be reused for:
+//   - P2G mass / momentum transfer
+//   - density / volume recomputation
+//   - stress force scatter
 struct WeightStencil {
   int base_i, base_j;
   float wx[3], wy[3];
@@ -156,70 +161,63 @@ struct WeightStencil {
   }
 };
 
-// ── BlockSpec
-// ─────────────────────────────────────────────────────────────────
-//  Describes a rectangular particle block to seed (used by initialize and
-//  addBlock).  The block is split into two horizontal bands separated by an
-//  optional gap.
+// ── BlockSpec ────────────────────────────────────────────────────────────────
+// Description of a rectangular block that is split into two horizontal layers.
+//
+// The seeded geometry is:
+//   lower band : [y_min,                y_min + layer_h]
+//   upper band : [y_min + layer_h + gap, y_max]
+//
+// with layer_h = 0.5 * (y_max - y_min - layer_gap).
 struct BlockSpec {
   float x_min = 3.f, x_max = 7.f;
   float y_min = 1.f, y_max = 5.f;
   float layer_gap = 0.02f;
-  FluidID bottom_fluid = 0; // fluid in the lower half
-  FluidID top_fluid = 1;    // fluid in the upper half
+  FluidID bottom_fluid = 0;
+  FluidID top_fluid = 1;
 };
 
-// ── MouseForceMode
-// ────────────────────────────────────────────────────────────
+// ── MouseForceMode ───────────────────────────────────────────────────────────
 enum class MouseForceMode { GRAB, WHIRL_LEGACY, WHIRL_POOL };
 
-// ── FluidSimulation
-// ────────────────────────────────────────────────────────
+// ── FluidSimulation ──────────────────────────────────────────────────────────
 class FluidSimulation {
 public:
   explicit FluidSimulation(SimParams params = {});
 
-  // ── Fluid registry ────────────────────────────────────────────────────────
+  // Fluid registry ------------------------------------------------------------
   int numFluids() const { return (int)fluids_.size(); }
 
-  // Register a new fluid.  Returns the FluidID assigned (0-based index).
-  // Returns -1 if kMaxFluids would be exceeded.
+  // Register a new fluid. Returns its FluidID, or -1 if the registry is full.
   int addFluid(FluidParams fp);
 
-  // Remove fluid at index id.  Returns false if id is out of range or it
-  // would leave the registry empty.  Existing particles keep their ID but
-  // their params become undefined until the slot is refilled or they are
-  // cleared.
+  // Remove a fluid slot. At least one fluid must remain.
+  // The implementation compacts the registry and shifts particle FluidIDs above
+  // the removed slot down by one.
   bool removeFluid(FluidID id);
 
-  // How many live particles carry a given FluidID.
   int particleCountForFluid(FluidID id) const;
 
   const FluidParams &fluidParams(FluidID id) const { return fluids_.at(id); }
   FluidParams &fluidParamsMutable(FluidID id) { return fluids_.at(id); }
   const std::vector<FluidParams> &allFluids() const { return fluids_; }
 
-  // ── Simulation lifetime ───────────────────────────────────────────────────
-  // Clear all particles and seed from block.
-  void initialize(const BlockSpec &block);
+  // Simulation lifetime -------------------------------------------------------
+  void initialize(const BlockSpec &block); // clear all particles, then seed
 
-  // ── Mouse forces ─────────────────────────────────────────────────────────
-  // Call between steps to inject a user-specified force.
-  // pos: cursor position in domain coords
-  // radius: influence radius in metres
-  // strength: force magnitude [m/s²] – additive to node velocity
-  // mode: GRAB (radial) or WHIRL (tangential)
+  // Mouse-driven forcing ------------------------------------------------------
+  // These forces are injected on the grid after gridUpdate() and before G2P.
   void setMouseForce(Eigen::Vector2f pos, float radius, float strength,
                      MouseForceMode mode, bool active);
   void clearMouseForce() { mouse_active_ = false; }
 
-  // Add particles from block without clearing existing ones.
+  // Add another two-band block without clearing existing particles.
   void addBlock(const BlockSpec &block);
 
   void clearParticles() { particles_.clear(); }
   void step();
 
-  // ── Accessors ─────────────────────────────────────────────────────────────
+  // Accessors ----------------------------------------------------------------
   const std::vector<Particle> &particles() const { return particles_; }
   const SimParams &params() const { return params_; }
   SimParams &paramsMutable() { return params_; }
@@ -248,7 +246,7 @@ private:
   std::vector<GridNode> grid_;
   int frame_ = 0;
 
-  // Mouse force state
+  // Mouse force state ---------------------------------------------------------
   bool mouse_active_ = false;
   Eigen::Vector2f mouse_pos_ = Eigen::Vector2f::Zero();
   float mouse_radius_ = 0.8f;

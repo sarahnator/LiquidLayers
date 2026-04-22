@@ -1,6 +1,22 @@
 // =============================================================================
-//  mpm_fluid.cpp  (v2)
+//  mpm_fluid.cpp
 // =============================================================================
+//  Implementation notes for the current solver:
+//
+//  Core timestep structure
+//    1. P2G mass / APIC momentum transfer
+//    2. Recompute per-particle effective volume from the grid density
+//    3. P2G stress force transfer
+//    4. Grid velocity update + gravity + boundary conditions
+//    5. Optional mouse-force injection on the grid
+//    6. G2P velocity gather + J update + particle advection
+//
+//  Important current-code detail:
+//    The live code is presently using the linear Jacobian update
+//        J <- clamp(J * (1 + dt * div(v)), 0.1, 5.0)
+//    not the exponential update described in some older comments. Those older
+//    remarks are preserved only where useful as context for why the linear
+//    form was chosen back for experimentation.
 
 #include "mpm_fluid.h"
 #include <algorithm>
@@ -99,13 +115,16 @@ void FluidSimulation::seedBand(float x0, float x1, float y0, float y1,
 // ─────────────────────────────────────────────────────────────────────────────
 //  initialize() / addBlock()
 //
-//  A BlockSpec splits the rectangle into two horizontal bands separated by an
-//  optional gap:
+//  A BlockSpec always creates two horizontal bands separated by an optional
+//  gap:
 //
-//    top    band: [y_mid + gap/2,  y_max]   → top_fluid
-//    bottom band: [y_min,          y_mid - gap/2] → bottom_fluid
+//    lower band : [y_min,                y_min + layer_h]        ->
+//    bottom_fluid upper band : [y_min + layer_h + gap, y_max]                ->
+//    top_fluid
 //
-//  To configure a Rayleigh-Taylor scenario: assign the heavy fluid as top_fluid
+//  There is no invert / swap flag in the current code. To create a stable
+//  layering, put the denser fluid in bottom_fluid. To create a Rayleigh-Taylor
+//  unstable layering, put the denser fluid in top_fluid.
 // ─────────────────────────────────────────────────────────────────────────────
 void FluidSimulation::addBlock(const BlockSpec &block) {
   float H = block.y_max - block.y_min;
@@ -148,46 +167,23 @@ void FluidSimulation::initialize(const BlockSpec &block) {
 //
 //      τ = -J·p·I  +  J·μ·(C + Cᵀ)
 //
-//  Tait EOS:
+//    with pressure from a Tait-type equation of state (Tait EOS):
 //      p = K · (J^{-γ} - 1)
 //        = K · (exp(-γ·ln J) - 1)
 //
-//  Physical meaning of each term:
-//    -J·p·I    : isotropic pressure (compression → positive pressure →
-//    repulsion) J·μ·(C+Cᵀ): viscous stress proportional to the
-//    rate-of-deformation
-//               D = sym(C), which smooths velocity gradients
+//  Interpretation:
+//    -J p I           : isotropic pressure response
+//    J μ (C + Cᵀ)     : viscous stress from the symmetric part of the local
+//                       velocity gradient encoded by the APIC C matrix
 //
-//  Pressure cap:
-//    The Tait EOS diverges as J→0.  Even with the J clamp and the exp-based
-//    update, residual numerical noise can push J to kJ_min, giving pressures
-//    on the order of K·(kJ_min^{-γ}-1) which for γ=4, kJ_min=0.2 is ~624·K.
-//    A symmetric cap |p| ≤ kPressureCap prevents that from producing forces
-//    large enough to eject particles across the domain in one step.
-//    The cap value (5×10⁴ Pa) should be set ≫ the typical working pressure
-//    (a few ×K) but ≪ the blow-up value; tune if needed.
+//  The current implementation also includes the following safeguards:
+//    - clamps J to [0.1, 5]
+//    - computes Tait pressure
+//    - applies a small tension floor so large negative pressures do not
+//    build
+//      up during expansion
 // ─────────────────────────────────────────────────────────────────────────────
 Eigen::Matrix2f FluidSimulation::kirchhoffStress(const Particle &p) const {
-  // const FluidParams &fp = fluids_.at(p.fluid);
-
-  // // J is already clamped in G2P_advect, but clamp again defensively.
-  // float J = std::clamp(p.J, kJ_min, kJ_max);
-
-  // // Tait pressure: p = K·(J^{-γ} - 1)
-  // float pressure = fp.bulk_modulus * (std::exp(-fp.gamma * std::log(J))
-  // - 1.f);
-
-  // // Symmetric pressure cap: prevents extreme forces at the boundary on
-  // impact. pressure = std::clamp(pressure, -kPressureCap, kPressureCap);
-
-  // // Isotropic pressure term
-  // Eigen::Matrix2f tau = -J * pressure * Eigen::Matrix2f::Identity();
-
-  // // Viscous term: J·μ·(C + Cᵀ)
-  // // Note: (C + Cᵀ) = 2·sym(C) = 2·D, so J·μ·(C+Cᵀ) = J·2μ·D.
-  // // Some codes pre-bake the factor of 2 into μ; here it is explicit.
-  // if (fp.viscosity > 0.f)
-  //     tau += J * fp.viscosity * (p.C + p.C.transpose());
 
   const FluidParams &fp = fluids_.at(p.fluid);
 
@@ -203,10 +199,10 @@ Eigen::Matrix2f FluidSimulation::kirchhoffStress(const Particle &p) const {
   float p_floor = -0.1f * fp.bulk_modulus;
   pressure = std::max(pressure, p_floor);
 
-  // Isotropic pressure part:  -J·p·I
+  // Isotropic pressure term:  -J·p·I
   Eigen::Matrix2f tau = -J * pressure * Eigen::Matrix2f::Identity();
 
-  // Viscous part:  J · 2μ · D  where D = sym(C) = ½(C + Cᵀ)
+  // Viscous term:  J · 2μ · D  where D = sym(C) = ½(C + Cᵀ)
   // Note: the factor of 2 is absorbed into 2μ, so:
   //   J · 2μ · ½(C + Cᵀ)  =  J · μ · (C + Cᵀ)
   if (fp.viscosity > 0.f) {
@@ -484,28 +480,24 @@ void FluidSimulation::gridUpdate() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  G2P_advect()  —  Grid-to-Particle gather + J update + advection
+//  G2P_advect()  —  Grid-to-particle gather + J update + advection
 //
 //  Velocity gather (APIC):
-//      v_p    = Σ_i  w_{ip} · v_i^new
-//      B_p    = Σ_i  w_{ip} · v_i^new ⊗ (x_i - x_p)
-//      C_p    = D⁻¹ · B_p              (APIC velocity gradient)
+//      v_p = Σ_i w_ip v_i^new
+//      B_p = Σ_i w_ip v_i^new ⊗ (x_i - x_p)
+//      C_p = D_inv B_p
 //
-//  Jacobian update — FIX vs v1:
-//      J_p^{n+1} = J_p^n · exp(dt · tr(C_p))
+//  The current live code updates J with the linearized form
 //
-//  Rationale:
-//    The governing ODE is  dJ/dt = J · div(v) = J · tr(C).
-//    The explicit Euler discretisation  J *= (1 + dt·tr(C))  can produce
-//    negative J when dt·tr(C) < -1, which occurs on high-velocity impact
-//    (observed: dt·tr(C) ≈ -1.2×10⁷).  The exponential form is the exact
-//    solution of the ODE under frozen C and is unconditionally positive:
-//    no matter how negative tr(C) is, exp(...) > 0.  We then clamp J to
-//    [kJ_min, kJ_max] as a secondary safeguard.
+//      J <- J * (1 + dt * tr(C))
 //
-//  Advection:
-//      x_p^{n+1} = x_p^n + dt·v_p
-//    followed by a hard position clamp to keep particles inside the domain.
+//  and then clamps J into [0.1, 5].
+//
+//  Finally particles are advected with
+//
+//      x_p <- x_p + dt v_p
+//
+//  and clamped back into the domain.
 // ─────────────────────────────────────────────────────────────────────────────
 void FluidSimulation::G2P_advect() {
   const float dx = params_.dx;
@@ -534,13 +526,12 @@ void FluidSimulation::G2P_advect() {
     p.vel = v_new;
     p.C = D_inv * B;
 
-    // ── J update (exponential form) ───────────────────────────────────────
+    // ── J update (linearized form) ─────────────────────────────────
     // tr(C) = div(v) = local volumetric strain rate.
     float div_v = p.C.trace();
-    // p.J = std::clamp(p.J * std::exp(dt * div_v), kJ_min, kJ_max);
-    // exp(dt·tr(C)) is always positive, so J stays positive unconditionally.
-    // with the exponential update form, the particles compress into a line on
-    // impact with the floor
+    // This is the explicit / linearized update for dJ/dt = J div(v).
+    // Note it is not positivity preserving, which is why the clamp is still
+    // needed.
     p.J = std::clamp(p.J * (1.f + dt * div_v), 0.1f, 5.f);
 
     // ── Advect ────────────────────────────────────────────────────────────
@@ -559,7 +550,7 @@ void FluidSimulation::G2P_advect() {
 //    3. volumeRecompute — re-estimate vol₀ from grid density
 //    4. P2G_stress      — scatter internal forces using fresh vol₀
 //    5. gridUpdate      — momentum→velocity, gravity, BCs
-//    6. G2P_advect      — gather velocity, update J (exp form), advect
+//    6. G2P_advect      — gather velocity, update J (linearized form), advect
 // ─────────────────────────────────────────────────────────────────────────────
 void FluidSimulation::step() {
   clearGrid();
