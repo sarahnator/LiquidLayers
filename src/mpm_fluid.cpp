@@ -14,9 +14,6 @@
 //  Important current-code detail:
 //    The live code is presently using the linear Jacobian update
 //        J <- clamp(J * (1 + dt * div(v)), 0.1, 5.0)
-//    not the exponential update described in some older comments. Those older
-//    remarks are preserved only where useful as context for why the linear
-//    form was chosen back for experimentation.
 
 #include "mpm_fluid.h"
 #include <algorithm>
@@ -534,10 +531,17 @@ void FluidSimulation::G2P_advect() {
     // needed.
     p.J = std::clamp(p.J * (1.f + dt * div_v), 0.1f, 5.f);
 
-    // ── Advect ────────────────────────────────────────────────────────────
+    // ── Advect and clamp
+    // ────────────────────────────────────────────────────────────
     p.pos += dt * p.vel;
-    p.pos.x() = std::clamp(p.pos.x(), 0.001f, params_.domain_w - 0.001f);
-    p.pos.y() = std::clamp(p.pos.y(), 0.001f, params_.domain_h - 0.001f);
+
+    // Small boundary buffer
+    const float wall_buffer = 1.05f * dx;
+
+    p.pos.x() =
+        std::clamp(p.pos.x(), wall_buffer, params_.domain_w - wall_buffer);
+    p.pos.y() =
+        std::clamp(p.pos.y(), wall_buffer, params_.domain_h - wall_buffer);
   }
 }
 

@@ -24,13 +24,6 @@ target_compile_options(mpm_fluid PRIVATE
   $<$<CONFIG:Release>:-O3 -march=native>
   $<$<CONFIG:Debug>:-O0 -g>)
 
-#       add_executable(mpm_fluid_scripted src/main_mpm_fluid_scripted_preset.cpp src/mpm_fluid.cpp)
-# target_include_directories(mpm_fluid_scripted PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-# target_link_libraries(mpm_fluid_scripted PRIVATE polyscope Eigen3::Eigen)
-# target_compile_options(mpm_fluid_scripted PRIVATE
-#   $<$<CONFIG:Release>:-O3 -march=native>
-#   $<$<CONFIG:Debug>:-O0 -g>)
-
         add_executable(mpm_fluid_random src/main_mpm_fluid_scripted_random.cpp src/mpm_fluid.cpp)
 target_include_directories(mpm_fluid_random PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(mpm_fluid_random PRIVATE polyscope Eigen3::Eigen)

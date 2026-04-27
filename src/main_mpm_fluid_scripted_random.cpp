@@ -13,7 +13,7 @@ namespace {
 
 FluidSimulation *g_sim = nullptr;
 bool g_running = true;
-int g_steps_per_frame = 5;
+int g_steps_per_frame = 3;
 const char *kCloud = "particles";
 std::mt19937 g_rng(12345);
 
@@ -30,7 +30,13 @@ struct ScheduledForce {
 ScheduledForce g_force;
 bool g_force_active = false;
 int g_next_event_frame = 40;
-std::vector<std::string> g_event_log;
+struct EventLogEntry {
+  std::string short_msg;
+  std::string full_msg;
+};
+
+bool g_debug_event_log = false;
+std::vector<EventLogEntry> g_event_log;
 
 std::string ff(float x, int p = 2) {
   std::ostringstream oss;
@@ -86,8 +92,8 @@ std::string forceSummary(const ScheduledForce &burst) {
   return oss.str();
 }
 
-void logEvent(const std::string &s) {
-  g_event_log.push_back(s);
+void logEvent(const std::string &short_msg, const std::string &full_msg = "") {
+  g_event_log.push_back({short_msg, full_msg.empty() ? short_msg : full_msg});
   if (g_event_log.size() > 20)
     g_event_log.erase(g_event_log.begin());
 }
@@ -148,6 +154,10 @@ int ri(int a, int b) { return std::uniform_int_distribution<int>(a, b)(g_rng); }
 int secondsToFrames(const FluidSimulation &sim, float seconds) {
   const float dt = std::max(1e-6f, sim.params().dt);
   return std::max(1, (int)std::lround(seconds / dt));
+}
+
+static bool finiteVec(const Eigen::Vector2f &v) {
+  return std::isfinite(v.x()) && std::isfinite(v.y());
 }
 
 void resetRegistry(FluidSimulation &sim) {
@@ -225,41 +235,78 @@ Eigen::Vector2f sampleParticleBiasedPoint(const FluidSimulation &sim,
                                           float jitter_radius = 1.0f) {
   const auto &ps = sim.particles();
   const SimParams &sp = sim.params();
-  if (ps.empty()) {
-    return {rf(0.15f * sp.domain_w, 0.85f * sp.domain_w),
-            rf(0.20f * sp.domain_h, 0.85f * sp.domain_h)};
+
+  std::vector<int> valid;
+  valid.reserve(ps.size());
+
+  const float margin = std::max(0.35f, jitter_radius + 0.35f);
+
+  for (int k = 0; k < (int)ps.size(); ++k) {
+    const auto &p = ps[k];
+    if (!finiteVec(p.pos) || !finiteVec(p.vel))
+      continue;
+    if (p.pos.x() < margin || p.pos.x() > sp.domain_w - margin)
+      continue;
+    if (p.pos.y() < margin || p.pos.y() > sp.domain_h - margin)
+      continue;
+    valid.push_back(k);
   }
 
-  const auto &anchor = ps[ri(0, (int)ps.size() - 1)];
+  if (valid.empty()) {
+    return {rf(0.25f * sp.domain_w, 0.75f * sp.domain_w),
+            rf(0.35f * sp.domain_h, 0.80f * sp.domain_h)};
+  }
+
+  const auto &anchor = ps[valid[ri(0, (int)valid.size() - 1)]];
+
   const float angle = rf(0.f, 2.f * 3.14159265f);
   const float r = jitter_radius * std::sqrt(rf(0.f, 1.f));
   Eigen::Vector2f offset(r * std::cos(angle), r * std::sin(angle));
-  return clampToDomain(anchor.pos + offset, sp);
+
+  return clampToDomain(anchor.pos + offset, sp, margin);
 }
 
 void scheduleRandomForceBurst(int frame) {
   const SimParams &sp = g_sim->params();
+
   g_force.start = frame;
-  g_force.end = frame + ri(70, 270);
+  g_force.end = frame + ri(90, 220);
+
   g_force.mode =
       (ri(0, 1) == 0) ? MouseForceMode::GRAB : MouseForceMode::WHIRL_POOL;
 
   const float local_scale =
-      (g_force.mode == MouseForceMode::WHIRL_POOL) ? 0.9f : 1.3f;
+      (g_force.mode == MouseForceMode::WHIRL_POOL) ? 0.7f : 0.9f;
+
   g_force.p0 = sampleParticleBiasedPoint(*g_sim, local_scale);
   g_force.p1 = sampleParticleBiasedPoint(*g_sim, local_scale);
 
   if (g_force.mode == MouseForceMode::WHIRL_POOL) {
-    g_force.radius = rf(0.9f, 1.8f);
-    g_force.strength = rf(7.f, 12.f);
+    g_force.radius = rf(0.6f, 1.1f);
+    g_force.strength = rf(2.f, 5.f);
   } else {
-    g_force.radius = rf(0.8f, 1.5f);
-    g_force.strength = rf(6.f, 12.f);
+    g_force.radius = rf(0.5f, 1.0f);
+    g_force.strength = rf(2.f, 6.f);
   }
+
+  g_force.p0 = sampleParticleBiasedPoint(*g_sim, local_scale);
+  g_force.p1 = sampleParticleBiasedPoint(*g_sim, local_scale);
+
+  if (!finiteVec(g_force.p0) || !finiteVec(g_force.p1)) {
+    g_force_active = false;
+    g_sim->clearMouseForce();
+    logEvent("Skipped force burst: sampled non-finite mouse path");
+    return;
+  }
+
   g_force_active = true;
 
-  logEvent(std::string("Scheduled particle-biased burst: ") +
-           forceSummary(g_force));
+  const std::string short_msg = (g_force.mode == MouseForceMode::WHIRL_POOL)
+                                    ? "Scheduled whirlpool burst"
+                                    : "Scheduled grab sweep";
+
+  logEvent(short_msg, short_msg + ": " + forceSummary(g_force));
+  ;
 }
 
 void maybeSpawnRandomEvent() {
@@ -273,7 +320,8 @@ void maybeSpawnRandomEvent() {
     BlockSpec b = randomBlock(g_sim->params(), g_sim->numFluids());
     g_sim->addBlock(b);
     rebuildCloud(*g_sim);
-    logEvent("Dropped randomized block: " + blockSummary(b, *g_sim));
+    logEvent("Dropped randomized block",
+             "Dropped randomized block: " + blockSummary(b, *g_sim));
     spawned_block = true;
 
   } else if (choice <= 3) {
@@ -326,6 +374,9 @@ void uiCallback() {
   ImGui::SameLine();
   if (ImGui::Button("Force new event"))
     g_next_event_frame = g_sim->frame();
+
+  ImGui::SameLine();
+  ImGui::Checkbox("Verbose event log", &g_debug_event_log);
   ImGui::SliderInt("Steps / frame", &g_steps_per_frame, 1, 20);
   ImGui::Separator();
 
@@ -336,7 +387,9 @@ void uiCallback() {
   ImGui::Separator();
   ImGui::Text("Recent events:");
   for (int i = (int)g_event_log.size() - 1; i >= 0; --i) {
-    ImGui::BulletText("%s", g_event_log[i].c_str());
+    const std::string &msg =
+        g_debug_event_log ? g_event_log[i].full_msg : g_event_log[i].short_msg;
+    ImGui::BulletText("%s", msg.c_str());
   }
 
   ImGui::End();
